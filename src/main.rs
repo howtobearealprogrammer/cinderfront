@@ -29,6 +29,8 @@ const TICK_DT: f32 = 1.0 / TICKS_PER_SEC as f32;
 const TICKS_PER_TURN: u32 = 2;
 const TURN_DT: f32 = TICK_DT * TICKS_PER_TURN as f32;
 const HASH_EVERY: u32 = 20;
+/// Seconds the victory / defeat banner shows before returning to the menu.
+const END_DELAY: f32 = 5.0;
 
 /// Runs the session (net + sim + input) before anything is drawn.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -56,6 +58,8 @@ struct Play {
     hashes: BTreeMap<u32, u64>,
     /// Debug aid (CF_AUTOPLAY=1): scripted orders, to exercise netcode without a human.
     auto: Option<u8>,
+    /// Seconds since the match was decided.
+    over: Option<f32>,
 }
 
 impl Play {
@@ -70,6 +74,7 @@ impl Play {
             turn: 0,
             hashes: BTreeMap::new(),
             auto: std::env::var_os("CF_AUTOPLAY").map(|_| 0),
+            over: None,
         }
     }
 
@@ -436,6 +441,16 @@ fn run_session(
                 inp.mouse_released[i] = mouse.just_released(b);
             }
             p.frame(g, &mut status.0, dt, &inp);
+            // Once someone has won, show the result for a few seconds, then back to the menu.
+            if g.world.winner.is_some() {
+                let t = p.over.get_or_insert(0.0);
+                *t += dt;
+                g.menu_in = Some(END_DELAY - *t);
+                if *t >= END_DELAY {
+                    status.0.clear();
+                    next = Some(menu(""));
+                }
+            }
         }
     }
     if let Some(n) = next {

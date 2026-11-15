@@ -180,7 +180,8 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
                     position_type: PositionType::Absolute,
                     left: px(0),
                     width: px(100),
-                    height: px(120),
+                    height: px(150),
+                    flex_direction: FlexDirection::Column,
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
                     ..default()
@@ -188,7 +189,10 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
                 bg(rgba(0.0, 0.0, 0.0, 0.55)),
                 Visibility::Hidden,
             ))
-            .with_child(text(&font, "", 80.0, rgba(1.0, 0.84, 0.3, 1.0)));
+            .with_children(|b| {
+                b.spawn(text(&font, "", 80.0, rgba(1.0, 0.84, 0.3, 1.0)));
+                b.spawn(text(&font, "", 18.0, rgba(0.85, 0.87, 0.92, 1.0)));
+            });
             // Tech tree (hold Tab).
             root.spawn((
                 TechPanel,
@@ -444,12 +448,18 @@ fn update_hud(
     } else {
         None
     };
-    let mut banner_text = None;
+    let (mut banner_text, mut banner_sub) = (None, None);
     if let Ok((mut n, mut v, children)) = nodes.p5().single_mut() {
-        n.top = px(sh * 0.4 - 90.0);
+        n.top = px(sh * 0.4 - 105.0);
         n.width = px(vw);
         v.set_if_neq(if over.is_some() { Visibility::Inherited } else { Visibility::Hidden });
         banner_text = children.first().copied();
+        banner_sub = children.get(1).copied();
+    }
+    if let (Some(e), Some(t)) = (banner_sub, g.menu_in) {
+        if let Ok((mut txt, _)) = texts.p4().get_mut(e) {
+            txt.0 = format!("Returning to the main menu in {}", t.ceil().max(0.0) as i32);
+        }
     }
     if let (Some((s, c)), Some(e)) = (over, banner_text) {
         if let Ok((mut t, mut tc)) = texts.p4().get_mut(e) {

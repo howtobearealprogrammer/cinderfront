@@ -160,6 +160,8 @@ pub struct Game {
     /// Enemy structures as last seen.
     pub ghosts: HashMap<u32, Structure>,
     pub show_tech: bool,
+    /// Seconds until the finished match closes (set by the session).
+    pub menu_in: Option<f32>,
     rng: Rng,
 }
 
@@ -202,6 +204,7 @@ impl Game {
             fog_gen: 0,
             ghosts: HashMap::new(),
             show_tech: false,
+            menu_in: None,
             rng: Rng::new(0x1234_5678 ^ me as u32),
         };
         g.center_on(g.world.starts[me as usize]);
