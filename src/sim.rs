@@ -229,7 +229,26 @@ pub enum Command {
     Rally { id: u32, x: i32, y: i32 },
     /// Unpack MCVs into Command Yards where they stand.
     Deploy { units: Vec<u32> },
+    /// Attack-move back and forth between where each unit stands and (x, y).
+    Patrol { units: Vec<u32>, x: i32, y: i32 },
+    /// Move keeping the group's shape, at the speed of its slowest member.
+    Formation { units: Vec<u32>, x: i32, y: i32, attack: bool },
+    /// Append a step to each unit's order queue (shift-click). Idle units start it at once.
+    Queue { units: Vec<u32>, step: Step },
 }
+
+/// One queued order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Step {
+    Move(Tile),
+    AttackMove(Tile),
+    Attack(Target),
+    Patrol(Tile),
+    Harvest(Tile),
+}
+
+/// Most queued steps a unit holds.
+pub const MAX_QUEUE: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Order {
@@ -241,6 +260,8 @@ pub enum Order {
     Return,
     Pickup { cargo: u32, drop: Option<Tile> },
     Drop(Tile),
+    /// Attack-moving towards `to`; on arrival it swaps ends.
+    Patrol { from: Tile, to: Tile },
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +287,10 @@ pub struct Unit {
     pub load: i32,
     /// Ore patch a harvester was sent to; it keeps returning there until the patch runs dry.
     pub home_ore: Option<Tile>,
+    /// Orders to carry out after the current one (shift-click waypoints).
+    pub queue: VecDeque<Step>,
+    /// Formation moves hold everyone to the slowest member's speed (0 = no cap).
+    pub speed_cap: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -710,7 +735,7 @@ impl World {
         };
         add(self.tick as i64);
         for u in self.units.values() {
-            for v in [u.id as i64, u.pos.0 as i64, u.pos.1 as i64, u.hp as i64, u.load as i64] {
+            for v in [u.id as i64, u.pos.0 as i64, u.pos.1 as i64, u.hp as i64, u.load as i64, u.queue.len() as i64, u.speed_cap as i64] {
                 add(v);
             }
         }
@@ -768,6 +793,8 @@ impl World {
                 carried: false,
                 load: 0,
                 home_ore: None,
+                queue: VecDeque::new(),
+                speed_cap: 0,
             },
         );
         id
@@ -794,6 +821,8 @@ impl World {
             carried: false,
             load: 0,
             home_ore: None,
+            queue: VecDeque::new(),
+            speed_cap: 0,
         }
     }
 
@@ -867,6 +896,25 @@ impl World {
         let pi = p as usize;
         if pi >= self.players.len() || self.players[pi].defeated {
             return;
+        }
+        // A fresh (non-queued) order replaces whatever the units had lined up.
+        let fresh = match cmd {
+            Command::Move { units, .. }
+            | Command::Attack { units, .. }
+            | Command::Harvest { units, .. }
+            | Command::Return { units }
+            | Command::Stop { units }
+            | Command::Patrol { units, .. }
+            | Command::Formation { units, .. }
+            | Command::Airlift { units, .. } => Some(units),
+            _ => None,
+        };
+        if let Some(units) = fresh {
+            for id in self.own(p, units) {
+                let u = self.units.get_mut(&id).unwrap();
+                u.queue.clear();
+                u.speed_cap = 0;
+            }
         }
         match cmd {
             Command::StartBuild(kind) => {
@@ -1068,7 +1116,115 @@ impl World {
                     Self::halt(self.units.get_mut(&id).unwrap());
                 }
             }
+            Command::Patrol { units, x, y } => {
+                if !inb(*x, *y) {
+                    return;
+                }
+                let ids = self.own(p, units);
+                let spots = self.spread((*x, *y), ids.len());
+                for (i, id) in ids.iter().enumerate() {
+                    let dest = spots.get(i).copied().unwrap_or((*x, *y));
+                    self.start_step(*id, Step::Patrol(dest));
+                }
+            }
+            Command::Formation { units, x, y, attack } => {
+                if !inb(*x, *y) {
+                    return;
+                }
+                let ids = self.own(p, units);
+                if ids.is_empty() {
+                    return;
+                }
+                let n = ids.len() as i32;
+                let (sx, sy) = ids.iter().fold((0, 0), |a, id| (a.0 + self.units[id].tile.0, a.1 + self.units[id].tile.1));
+                let (cx, cy) = (sx.div_euclid(n), sy.div_euclid(n));
+                let slowest = |air: bool| {
+                    ids.iter().map(|id| self.units[id].kind.def()).filter(|d| d.air == air).map(|d| d.speed).min().unwrap_or(0)
+                };
+                let (ground_cap, air_cap) = (slowest(false), slowest(true));
+                let mut used: Vec<Tile> = Vec::new();
+                for id in &ids {
+                    let (tile, air) = (self.units[id].tile, self.units[id].kind.def().air);
+                    // Keep each unit's offset from the group centre, within reason.
+                    let off = ((tile.0 - cx).clamp(-5, 5), (tile.1 - cy).clamp(-5, 5));
+                    let want = ((x + off.0).clamp(0, MAP_W - 1), (y + off.1).clamp(0, MAP_H - 1));
+                    let ok = |t: Tile, used: &Vec<Tile>| (air || self.walkable(t.0, t.1)) && !used.contains(&t);
+                    let dest = if ok(want, &used) {
+                        want
+                    } else {
+                        (1..=4)
+                            .flat_map(|r| (-r..=r).flat_map(move |dy| (-r..=r).map(move |dx| (want.0 + dx, want.1 + dy))))
+                            .find(|t| inb(t.0, t.1) && ok(*t, &used))
+                            .unwrap_or((*x, *y))
+                    };
+                    used.push(dest);
+                    self.start_step(*id, if *attack { Step::AttackMove(dest) } else { Step::Move(dest) });
+                    let cap = if air { air_cap } else { ground_cap };
+                    if let Some(u) = self.units.get_mut(id) {
+                        u.speed_cap = if cap < u.kind.def().speed { cap } else { 0 };
+                    }
+                }
+            }
+            Command::Queue { units, step } => {
+                let ids = self.own(p, units);
+                // Spread ground destinations so a queued group does not pile onto one tile.
+                let spots = match step {
+                    Step::Move(t) | Step::AttackMove(t) | Step::Patrol(t) if inb(t.0, t.1) => self.spread(*t, ids.len()),
+                    _ => Vec::new(),
+                };
+                for (i, id) in ids.iter().enumerate() {
+                    let step = match (*step, spots.get(i)) {
+                        (Step::Move(_), Some(t)) => Step::Move(*t),
+                        (Step::AttackMove(_), Some(t)) => Step::AttackMove(*t),
+                        (Step::Patrol(_), Some(t)) => Step::Patrol(*t),
+                        (s, _) => s,
+                    };
+                    let u = &self.units[id];
+                    let idle = u.order == Order::Idle && u.queue.is_empty();
+                    if idle {
+                        self.start_step(*id, step);
+                    } else if u.queue.len() < MAX_QUEUE {
+                        self.units.get_mut(id).unwrap().queue.push_back(step);
+                    }
+                }
+            }
         }
+    }
+
+    /// Give one unit an order from a step (fresh or from its queue). Steps a unit
+    /// cannot carry out (a harvest for a tank, an attack on a friend) are skipped.
+    fn start_step(&mut self, id: u32, step: Step) {
+        let Some(u) = self.units.get(&id) else { return };
+        let (tile, d, loaded, owner) = (u.tile, u.kind.def(), u.cargo.is_some(), u.owner);
+        let order = match step {
+            Step::Move(t) | Step::AttackMove(t) | Step::Patrol(t) if !inb(t.0, t.1) => return,
+            Step::Move(t) if loaded => Order::Drop(t),
+            Step::Move(t) => Order::Move(t),
+            Step::AttackMove(t) => Order::AttackMove(t),
+            Step::Patrol(t) => Order::Patrol { from: tile, to: t },
+            Step::Attack(target) => {
+                let enemy = self.target_info((0, 0), target).is_some_and(|i| i.2 != owner);
+                if !enemy || d.damage == 0 {
+                    return;
+                }
+                Order::Attack(target)
+            }
+            Step::Harvest(t) => {
+                if u.kind != UnitKind::Harvester || !inb(t.0, t.1) {
+                    return;
+                }
+                Order::Harvest(Some(t))
+            }
+        };
+        let path = match order {
+            Order::Move(t) | Order::AttackMove(t) | Order::Patrol { to: t, .. } if !d.air => self.find_path(tile, t, false),
+            _ => Vec::new(),
+        };
+        let u = self.units.get_mut(&id).unwrap();
+        u.order = order;
+        u.path = path;
+        u.stuck = 0;
+        u.blocked = 0;
     }
 
     // ---------- tick ----------
@@ -1088,7 +1244,28 @@ impl World {
             }
             self.units.insert(id, u);
         }
+        self.next_steps();
         self.cleanup();
+    }
+
+    /// Units that finished their order move on to the next queued one.
+    fn next_steps(&mut self) {
+        let ready: Vec<u32> = self
+            .units
+            .values()
+            .filter(|u| u.order == Order::Idle && u.hp > 0 && !u.carried)
+            .map(|u| u.id)
+            .collect();
+        for id in ready {
+            let u = self.units.get_mut(&id).unwrap();
+            u.speed_cap = 0;
+            while let Some(step) = self.units.get_mut(&id).and_then(|u| u.queue.pop_front()) {
+                self.start_step(id, step);
+                if self.units[&id].order != Order::Idle {
+                    break;
+                }
+            }
+        }
     }
 
     fn production(&mut self) {
@@ -1272,6 +1449,16 @@ impl World {
                     u.order = Order::Idle;
                 }
             }
+            Order::Patrol { from, to } => {
+                if self.auto_fire(u) {
+                    u.hold_until = self.tick + d.cooldown as u32 + 2;
+                }
+                if u.path.is_empty() && at_center && self.tick >= u.hold_until {
+                    // Turn round. If the far end is unreachable, patrol in place.
+                    u.order = Order::Patrol { from: to, to: from };
+                    u.path = self.find_path(u.tile, from, false);
+                }
+            }
             Order::Attack(t) => match self.attack_order(u, t) {
                 None => Self::halt(u),
                 Some((true, ..)) => u.path.clear(),
@@ -1345,7 +1532,7 @@ impl World {
     }
 
     fn step_ground(&mut self, u: &mut Unit) {
-        let speed = u.kind.def().speed;
+        let speed = Self::speed(u);
         if u.pos == center(u.tile) {
             if self.tick < u.hold_until {
                 return;
@@ -1387,8 +1574,17 @@ impl World {
         u.pos.1 += dy.clamp(-sp, sp);
     }
 
+    fn speed(u: &Unit) -> i32 {
+        let base = u.kind.def().speed;
+        if u.speed_cap > 0 {
+            base.min(u.speed_cap)
+        } else {
+            base
+        }
+    }
+
     fn fly(u: &mut Unit, to: Pos) -> bool {
-        let sp = u.kind.def().speed as i64;
+        let sp = Self::speed(u) as i64;
         let (dx, dy) = ((to.0 - u.pos.0) as i64, (to.1 - u.pos.1) as i64);
         let dd = dx * dx + dy * dy;
         if dd <= sp * sp {
@@ -1411,6 +1607,12 @@ impl World {
                 self.auto_fire(u);
                 if Self::fly(u, center(t)) {
                     u.order = Order::Idle;
+                }
+            }
+            Order::Patrol { from, to } => {
+                self.auto_fire(u);
+                if Self::fly(u, center(to)) {
+                    u.order = Order::Patrol { from: to, to: from };
                 }
             }
             Order::Attack(t) => match self.attack_order(u, t) {

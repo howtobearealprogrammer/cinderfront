@@ -311,3 +311,73 @@ fn mcv_deploys_into_a_yard_and_rocket_turret_outranges_turret() {
     assert!(w.units[&tank].hp < hp, "rocket turret should have fired");
     assert!(w.structs.contains_key(&rt));
 }
+
+/// A clear ground tile near player 0's start, `dx` tiles east of it.
+fn near_start(w: &World, dx: i32, dy: i32) -> Tile {
+    let (cx, cy) = w.starts[0];
+    (cx + dx, cy + dy)
+}
+
+#[test]
+fn queued_orders_run_in_turn() {
+    let mut w = World::new(7, 2);
+    let id = w.new_unit(0, UnitKind::Buggy, near_start(&w, 0, 5));
+    let (a, b) = (near_start(&w, 6, 5), near_start(&w, 6, 9));
+    w.apply(0, &Command::Move { units: vec![id], x: a.0, y: a.1, attack: false });
+    w.apply(0, &Command::Queue { units: vec![id], step: Step::Move(b) });
+    assert_eq!(w.units[&id].queue.len(), 1, "busy unit keeps the step for later");
+    let mut reached_a = false;
+    for _ in 0..600 {
+        w.tick();
+        reached_a |= w.units[&id].tile == a;
+    }
+    assert!(reached_a, "first waypoint visited");
+    assert_eq!(w.units[&id].tile, b, "ends at the queued waypoint");
+    assert!(w.units[&id].queue.is_empty());
+
+    // A fresh order throws the queue away.
+    w.apply(0, &Command::Move { units: vec![id], x: a.0, y: a.1, attack: false });
+    w.apply(0, &Command::Queue { units: vec![id], step: Step::Move(b) });
+    w.apply(0, &Command::Stop { units: vec![id] });
+    assert!(w.units[&id].queue.is_empty());
+
+    // An idle unit starts a queued step straight away.
+    w.apply(0, &Command::Queue { units: vec![id], step: Step::Move(a) });
+    assert_eq!(w.units[&id].order, Order::Move(a));
+}
+
+#[test]
+fn patrol_goes_back_and_forth() {
+    let mut w = World::new(7, 2);
+    let start = near_start(&w, 0, 5);
+    let id = w.new_unit(0, UnitKind::Buggy, start);
+    let far = near_start(&w, 7, 5);
+    w.apply(0, &Command::Patrol { units: vec![id], x: far.0, y: far.1 });
+    let (mut out, mut back) = (false, false);
+    for _ in 0..800 {
+        w.tick();
+        let t = w.units[&id].tile;
+        out |= t == far;
+        back |= out && t == start;
+    }
+    assert!(out && back, "patrol should reach the far end and come back");
+    assert!(matches!(w.units[&id].order, Order::Patrol { .. }), "still patrolling");
+}
+
+#[test]
+fn formation_keeps_shape_and_pace() {
+    let mut w = World::new(7, 2);
+    let slow = w.new_unit(0, UnitKind::Tank, near_start(&w, 0, 5));
+    let fast = w.new_unit(0, UnitKind::Buggy, near_start(&w, 2, 5));
+    let target = near_start(&w, 1, 9);
+    w.apply(0, &Command::Formation { units: vec![slow, fast], x: target.0, y: target.1, attack: false });
+    let tank_speed = UnitKind::Tank.def().speed;
+    assert_eq!(w.units[&fast].speed_cap, tank_speed, "buggy held to the tank's pace");
+    for _ in 0..600 {
+        w.tick();
+    }
+    let (ts, tf) = (w.units[&slow].tile, w.units[&fast].tile);
+    assert_eq!(tf.0 - ts.0, 2, "side-by-side spacing kept");
+    assert_eq!(tf.1, ts.1);
+    assert_eq!(w.units[&fast].speed_cap, 0, "cap lifted on arrival");
+}
