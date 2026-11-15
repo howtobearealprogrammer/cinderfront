@@ -456,9 +456,16 @@ fn update_hud(
         banner_text = children.first().copied();
         banner_sub = children.get(1).copied();
     }
-    if let (Some(e), Some(t)) = (banner_sub, g.menu_in) {
+    if let Some(e) = banner_sub {
+        let sub = match g.menu_in {
+            Some(t) => format!("Returning to the main menu in {}", t.ceil().max(0.0) as i32),
+            None if over.is_some() => "Keep watching, or press Esc to leave the match".to_string(),
+            None => String::new(),
+        };
         if let Ok((mut txt, _)) = texts.p4().get_mut(e) {
-            txt.0 = format!("Returning to the main menu in {}", t.ceil().max(0.0) as i32);
+            if txt.0 != sub {
+                txt.0 = sub;
+            }
         }
     }
     if let (Some((s, c)), Some(e)) = (over, banner_text) {

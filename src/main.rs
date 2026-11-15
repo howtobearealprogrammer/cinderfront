@@ -10,7 +10,7 @@ use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode, WindowResolution};
+use bevy::window::{CursorGrabMode, CursorOptions, MonitorSelection, PrimaryWindow, WindowMode, WindowResolution};
 use cinderfront::net::{self, Conn, Finder, Host, C2H, H2C};
 use cinderfront::sim::{Command, StructKind, UnitKind, World, TICKS_PER_SEC};
 use game::{Game, InputSnap};
@@ -205,9 +205,14 @@ enum Screen {
     Play(Box<Play>),
 }
 
-/// The current screen. Sockets and channels are not `Sync`, hence the cell.
+/// The current screen. Sockets and channels are not `Sync`, hence the cells.
 #[derive(Resource)]
-struct Session(SyncCell<Screen>);
+struct Session {
+    screen: SyncCell<Screen>,
+    /// A match this machine hosts but its player has left (knocked out): it keeps
+    /// running, unseen, so the others can finish it.
+    background: SyncCell<Option<(Box<Play>, Game)>>,
+}
 
 fn menu(msg: &str) -> Screen {
     Screen::Menu(Menu { ip: String::new(), finder: Finder::new().ok(), found: Vec::new(), msg: msg.into() })
@@ -285,7 +290,17 @@ fn run_session(
     windows: Query<&Window>,
 ) {
     let dt = time.delta_secs().min(0.25);
-    let screen = session.0.get();
+    let Session { screen, background } = &mut *session;
+    let (screen, background) = (screen.get(), background.get());
+    if let Some((p, g)) = background.as_mut() {
+        let mut quiet = String::new();
+        p.frame(g, &mut quiet, dt, &InputSnap::default());
+        let everyone_gone = matches!(&p.net, Net::Host(h) if h.clients.iter().all(|c| !c.open));
+        if g.world.winner.is_some() || everyone_gone {
+            *background = None;
+        }
+    }
+    let mut leave = false;
     let (white, light, gray, red, orange) = (
         rgba(1.0, 1.0, 1.0, 1.0),
         rgba(0.78, 0.78, 0.78, 1.0),
@@ -329,6 +344,11 @@ fn run_session(
                 line(format!("Join address (type, blank = first found): {}_", m.ip), 24.0, light),
                 line(format!("Hosts on LAN: {found}"), 24.0, light),
                 line(m.msg.clone(), 24.0, red),
+                line(
+                    if background.is_some() { "Still hosting your last match for the other players - it closes when they finish" } else { "" },
+                    20.0,
+                    gray,
+                ),
                 line("", 10.0, white),
             ];
             let help = [
@@ -348,7 +368,9 @@ fn run_session(
             ];
             lines.extend(help.iter().map(|h| line(*h, 22.0, gray)));
             menu_out.lines = lines;
-            if keys.just_pressed(KeyCode::KeyH) {
+            if keys.just_pressed(KeyCode::KeyH) && background.is_some() {
+                m.msg = "Can't host a new game until your last match finishes".into();
+            } else if keys.just_pressed(KeyCode::KeyH) {
                 next = Some(host(net::TCP_PORT, 0));
             } else if keys.just_pressed(KeyCode::KeyS) {
                 next = Some(solo(&mut view));
@@ -441,6 +463,9 @@ fn run_session(
                 inp.mouse_released[i] = mouse.just_released(b);
             }
             p.frame(g, &mut status.0, dt, &inp);
+            // Knocked out while others play on: Esc leaves.
+            let out = g.world.players[g.me as usize].defeated && g.world.winner.is_none();
+            leave = out && keys.just_pressed(KeyCode::Escape);
             // Once someone has won, show the result for a few seconds, then back to the menu.
             if g.world.winner.is_some() {
                 let t = p.over.get_or_insert(0.0);
@@ -453,11 +478,31 @@ fn run_session(
             }
         }
     }
+    if leave {
+        if let Screen::Play(p) = std::mem::replace(screen, menu("")) {
+            let game = view.0.take();
+            // A host has to keep relaying turns, so its match carries on in the background.
+            if let (Net::Host(_), Some(g)) = (&p.net, game) {
+                *background = Some((p, g));
+            }
+        }
+        status.0.clear();
+    }
     if let Some(n) = next {
         if !matches!(n, Screen::Play(_)) {
             view.0 = None;
         }
         *screen = n;
+    }
+}
+
+/// In fullscreen the pointer stays on this window (so edge scrolling works with
+/// a second monitor); windowed or unfocused, it is free.
+fn confine_cursor(mut windows: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>) {
+    let Ok((w, mut c)) = windows.single_mut() else { return };
+    let want = if w.focused && !matches!(w.mode, WindowMode::Windowed) { CursorGrabMode::Confined } else { CursorGrabMode::None };
+    if c.grab_mode != want {
+        c.grab_mode = want;
     }
 }
 
@@ -531,10 +576,10 @@ fn main() {
     }
     app.insert_resource(ClearColor(Color::srgb(0.03, 0.03, 0.04)))
         .insert_resource(view)
-        .insert_resource(Session(SyncCell::new(screen)))
+        .insert_resource(Session { screen: SyncCell::new(screen), background: SyncCell::new(None) })
         .init_resource::<Status>()
         .add_plugins((scene::ScenePlugin, hud::HudPlugin, cursor::CursorPlugin))
         .add_systems(Update, run_session.in_set(RunGame))
-        .add_systems(Update, (auto_shot, toggle_fullscreen))
+        .add_systems(Update, (auto_shot, toggle_fullscreen, confine_cursor))
         .run();
 }
