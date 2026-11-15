@@ -26,7 +26,7 @@ pub enum Terrain {
     Cliff,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum UnitKind {
     Trooper,
     Rocketeer,
@@ -39,7 +39,7 @@ pub enum UnitKind {
     Mcv,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum StructKind {
     Yard,
     Slab,

@@ -5,7 +5,21 @@ edition = "2021"
 
 [dependencies]
 if-addrs = "0.15.0"
-macroquad = { version = "0.4", default-features = false }
+bevy = { version = "0.20.1", default-features = false, features = [
+    "default_app",
+    "std",
+    "3d_bevy_render",
+    "ui_api",
+    "ui_bevy_render",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "multi_threaded",
+    "default_font",
+    "scene",
+    "keyboard",
+    "mouse",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
