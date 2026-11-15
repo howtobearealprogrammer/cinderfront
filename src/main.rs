@@ -1,3 +1,4 @@
+mod cursor;
 mod game;
 mod gfx;
 mod hud;
@@ -9,7 +10,7 @@ use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-use bevy::window::WindowResolution;
+use bevy::window::{MonitorSelection, PrimaryWindow, WindowMode, WindowResolution};
 use cinderfront::net::{self, Conn, Finder, Host, C2H, H2C};
 use cinderfront::sim::{Command, StructKind, UnitKind, World, TICKS_PER_SEC};
 use game::{Game, InputSnap};
@@ -18,6 +19,10 @@ use hud::MenuContent;
 use scene::View;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/assets.rs"));
+}
 
 const MAP_SEED: u32 = 7;
 const TICK_DT: f32 = 1.0 / TICKS_PER_SEC as f32;
@@ -322,17 +327,19 @@ fn run_session(
                 line("", 10.0, white),
             ];
             let help = [
-                "Left click / drag: select      Right click: move, attack, harvest",
+                "Left click / drag: select units (or buildings)     Double click: all of that kind on screen",
+                "Right click: move, attack, harvest - the cursor shows which     Shift: queue     Ctrl: formation     Alt: attack-move",
+                "A: attack-move     Q: patrol     S: stop     R: repair     V: sell     F11: fullscreen",
+                "1..9: select group (twice: jump to it)     Ctrl+1..9: set group     Shift+1..9: add to group",
                 "Sidebar: left click build or train, right click cancel",
                 "When a structure shows READY, click it again, then left click the map to place (Shift = build another)",
                 "Structures need rock. Lay slabs first or they start at half strength.",
-                "Q + click: attack-move     X: stop     Ctrl+1..9 / 1..9: groups     R: repair     V: sell",
                 "MCV: build at Factory, drive (or airlift) to clear rock, press F to unpack a new Command Yard",
                 "TECH TREE: hold Tab in game. Locked buttons say what they need",
-                "GATHER POINT: left click a Barracks / Factory / Airpad, then right click the map",
+                "GATHER POINT: select a Barracks / Factory / Airpad, then right click the map",
                 "AIRLIFT: select ground units, press T, click anywhere - free Carriers fetch and deliver",
                 "         or select a Carrier, right click a unit to lift, right click ground to drop",
-                "WASD / arrows / screen edge / middle-drag: scroll     Wheel: zoom     Space: jump to base",
+                "Arrows / screen edge / middle-drag: scroll     Wheel: zoom     Space: jump to base",
             ];
             lines.extend(help.iter().map(|h| line(*h, 22.0, gray)));
             menu_out.lines = lines;
@@ -439,6 +446,19 @@ fn run_session(
     }
 }
 
+/// F11 switches between borderless fullscreen and a window.
+fn toggle_fullscreen(keys: Res<ButtonInput<KeyCode>>, mut windows: Query<&mut Window, With<PrimaryWindow>>) {
+    if !keys.just_pressed(KeyCode::F11) {
+        return;
+    }
+    if let Ok(mut w) = windows.single_mut() {
+        w.mode = match w.mode {
+            WindowMode::Windowed => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+            _ => WindowMode::Windowed,
+        };
+    }
+}
+
 /// CF_SHOT=path.png: screenshot after CF_SHOT_AT seconds (default 8), then quit. For checking visuals.
 /// CF_ZOOM (demo only) sets the starting zoom.
 fn auto_shot(
@@ -460,7 +480,15 @@ fn auto_shot(
 }
 
 fn main() {
+    if let Some(path) = std::env::var_os("CF_CURSORS") {
+        let (w, h, px) = cursor::sheet();
+        cursor::write_png(std::path::Path::new(&path), w, h, &px).expect("write cursor sheet");
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
+    // Fullscreen by default; `--windowed` (or a screenshot run) opens a 1280x800 window.
+    let windowed = args.iter().any(|a| a == "--windowed") || std::env::var_os("CF_SHOT").is_some();
+    let args: Vec<String> = args.into_iter().filter(|a| a != "--windowed").collect();
     let mut view = View::default();
     let screen = match args.get(1).map(|s| s.as_str()) {
         Some("solo") => solo(&mut view),
@@ -469,21 +497,29 @@ fn main() {
         Some("join") if args.len() > 2 => join(&args[2]),
         _ => menu(""),
     };
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Cinderfront".into(),
                 resolution: WindowResolution::new(1280, 800),
+                mode: if windowed { WindowMode::Windowed } else { WindowMode::BorderlessFullscreen(MonitorSelection::Primary) },
                 ..default()
             }),
             ..default()
-        }))
-        .insert_resource(ClearColor(Color::srgb(0.03, 0.03, 0.04)))
+        }));
+    // Models, icons and the font are compiled in (see build.rs) and served as embedded://.
+    {
+        let reg = app.world().resource::<bevy::asset::io::embedded::EmbeddedAssetRegistry>();
+        for (path, bytes) in embedded::ASSETS {
+            reg.insert_asset(std::path::PathBuf::from(path), std::path::Path::new(path), *bytes);
+        }
+    }
+    app.insert_resource(ClearColor(Color::srgb(0.03, 0.03, 0.04)))
         .insert_resource(view)
         .insert_resource(Session(SyncCell::new(screen)))
         .init_resource::<Status>()
-        .add_plugins((scene::ScenePlugin, hud::HudPlugin))
+        .add_plugins((scene::ScenePlugin, hud::HudPlugin, cursor::CursorPlugin))
         .add_systems(Update, run_session.in_set(RunGame))
-        .add_systems(Update, auto_shot)
+        .add_systems(Update, (auto_shot, toggle_fullscreen))
         .run();
 }

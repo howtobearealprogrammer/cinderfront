@@ -89,7 +89,7 @@ struct TechRow(StructKind);
 #[derive(Component)]
 struct DragRect;
 
-const FONT: &str = "DejaVuSans-Bold.ttf";
+const FONT: &str = "embedded://DejaVuSans-Bold.ttf";
 
 fn abs(x: f32, y: f32, w: f32, h: f32) -> Node {
     Node {
@@ -265,7 +265,7 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
                         b.spawn((IconPart(slot, Role::Progress), abs(0.0, 0.0, 0.0, 38.0), bg(rgba(0.2, 0.65, 0.35, 0.55))));
                         match file {
                             Some(f) => {
-                                b.spawn((abs(46.0, 1.0, 50.0, 37.5), ImageNode::new(server.load(format!("icons/{f}.png")))));
+                                b.spawn((abs(46.0, 1.0, 50.0, 37.5), ImageNode::new(server.load(format!("embedded://icons/{f}.png")))));
                             }
                             None => {
                                 b.spawn((abs(62.0, 8.0, 22.0, 22.0), bg(rgba(0.62, 0.62, 0.65, 1.0))));

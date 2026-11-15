@@ -19,6 +19,7 @@ bevy = { version = "0.20.1", default-features = false, features = [
     "scene",
     "keyboard",
     "mouse",
+    "custom_cursor",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

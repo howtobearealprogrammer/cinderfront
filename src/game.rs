@@ -9,7 +9,7 @@ use crate::gfx::{fade, rgba, Rgba, Rng};
 use bevy::input::keyboard::KeyCode;
 use bevy::math::{Rect, Vec2};
 use cinderfront::sim::{
-    center, idx, inb, Command, Event, StructKind, Structure, Target, Terrain, Unit, UnitKind, World, MAP_H, MAP_W, TILE,
+    center, idx, inb, Command, Step, Event, StructKind, Structure, Target, Terrain, Unit, UnitKind, World, MAP_H, MAP_W, TILE,
     TRAIN_AT,
 };
 use std::collections::HashMap;
@@ -38,9 +38,42 @@ pub const PCOL: [Rgba; 4] = [
 pub enum Mode {
     Normal,
     AttackMove,
+    Patrol,
     Airlift,
     Repair,
     Sell,
+}
+
+/// What a right click would do right now (see `Game::context`).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Ctx {
+    None,
+    Select,
+    Move,
+    Attack(Target),
+    Pickup(u32),
+    Return,
+    Harvest,
+    Rally,
+}
+
+/// Mouse pointer shapes; drawn in `cursor.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cursor {
+    Normal,
+    Select,
+    Move,
+    Attack,
+    AttackMove,
+    Patrol,
+    Harvest,
+    Return,
+    Pickup,
+    Airlift,
+    Repair,
+    Sell,
+    Rally,
+    Deny,
 }
 
 pub enum Fx {
@@ -100,7 +133,10 @@ pub struct Game {
     pub alpha: f32,
     pub time: f32,
     pub sel: Vec<u32>,
-    pub sel_struct: Option<u32>,
+    pub sel_structs: Vec<u32>,
+    pub cursor: Cursor,
+    last_click: Option<(Vec2, f32)>,
+    last_group_tap: Option<(usize, f32)>,
     pub drag: Option<Vec2>,
     pub mouse: Vec2,
     last_mouse: Vec2,
@@ -113,7 +149,8 @@ pub struct Game {
     pub shake: f32,
     pub shake_off: Vec2,
     pub shown_credits: f32,
-    groups: Vec<Vec<u32>>,
+    /// Control groups: units and buildings.
+    groups: Vec<(Vec<u32>, Vec<u32>)>,
     pub angles: HashMap<u32, f32>,
     /// Fog of war, per tile. Purely a view filter: the sim knows nothing about it.
     pub visible: Vec<bool>,
@@ -142,7 +179,10 @@ impl Game {
             alpha: 0.0,
             time: 0.0,
             sel: Vec::new(),
-            sel_struct: None,
+            sel_structs: Vec::new(),
+            cursor: Cursor::Normal,
+            last_click: None,
+            last_group_tap: None,
             drag: None,
             mouse: Vec2::ZERO,
             last_mouse: Vec2::ZERO,
@@ -155,7 +195,7 @@ impl Game {
             shake: 0.0,
             shake_off: Vec2::ZERO,
             shown_credits: credits,
-            groups: vec![Vec::new(); 9],
+            groups: vec![(Vec::new(), Vec::new()); 9],
             angles: HashMap::new(),
             visible: vec![false; tiles],
             explored: vec![false; tiles],
@@ -553,7 +593,7 @@ impl Game {
         let mut out = Vec::new();
         let (w, me) = (&self.world, self.me);
         self.sel.retain(|id| w.units.get(id).is_some_and(|u| u.owner == me && !u.carried));
-        self.sel_struct = self.sel_struct.filter(|id| w.structs.contains_key(id) && self.sel.is_empty());
+        self.sel_structs.retain(|id| w.structs.get(id).is_some_and(|s| s.owner == me));
         for u in w.units.values() {
             if u.face != (0, 0) {
                 let want = (u.face.1 as f32).atan2(u.face.0 as f32);
@@ -575,9 +615,10 @@ impl Game {
         let (sw, sh, vw) = (inp.screen.x, inp.screen.y, self.view_w());
         let shift = inp.down(KeyCode::ShiftLeft) || inp.down(KeyCode::ShiftRight);
         let ctrl = inp.down(KeyCode::ControlLeft) || inp.down(KeyCode::ControlRight);
+        let alt = inp.down(KeyCode::AltLeft) || inp.down(KeyCode::AltRight);
         self.show_tech = inp.down(KeyCode::Tab);
 
-        // Camera.
+        // Camera: arrows, screen edge, middle-drag, wheel.
         let sp = 22.5 * dt / self.zoom;
         let inside = inp.hover && m.x >= 0.0 && m.y >= 0.0 && m.x <= sw && m.y <= sh;
         if inp.mouse_down[2] {
@@ -585,16 +626,16 @@ impl Game {
             self.focus -= Vec2::new(d.x / self.k(), d.y / (self.k() * PITCH_S));
         }
         self.last_mouse = m;
-        if inp.down(KeyCode::ArrowLeft) || inp.down(KeyCode::KeyA) || (inside && m.x <= 2.0) {
+        if inp.down(KeyCode::ArrowLeft) || (inside && m.x <= 2.0) {
             self.focus.x -= sp;
         }
-        if inp.down(KeyCode::ArrowRight) || inp.down(KeyCode::KeyD) || (inside && m.x >= sw - 3.0) {
+        if inp.down(KeyCode::ArrowRight) || (inside && m.x >= sw - 3.0) {
             self.focus.x += sp;
         }
-        if inp.down(KeyCode::ArrowUp) || inp.down(KeyCode::KeyW) || (inside && m.y <= 2.0) {
+        if inp.down(KeyCode::ArrowUp) || (inside && m.y <= 2.0) {
             self.focus.y -= sp / PITCH_S;
         }
-        if inp.down(KeyCode::ArrowDown) || inp.down(KeyCode::KeyS) || (inside && m.y >= sh - 3.0) {
+        if inp.down(KeyCode::ArrowDown) || (inside && m.y >= sh - 3.0) {
             self.focus.y += sp / PITCH_S;
         }
         if inp.wheel != 0.0 && m.x < vw {
@@ -611,31 +652,28 @@ impl Game {
             let r = self.mm_rect();
             self.center_on((((m.x - r.min.x) / MM * MAP_W as f32) as i32, ((m.y - r.min.y) / MM * MAP_H as f32) as i32));
         }
-        let (hx, hy) = (vw / 2.0 / self.k(), sh / 2.0 / (self.k() * PITCH_S));
-        let clamp = |v: f32, half: f32, size: f32| {
-            let (lo, hi) = (half - 5.0, size - half + 5.0);
-            if lo > hi {
-                size / 2.0
-            } else {
-                v.clamp(lo, hi)
-            }
-        };
-        self.focus.x = clamp(self.focus.x, hx, MAP_W as f32);
-        self.focus.y = clamp(self.focus.y, hy, MAP_H as f32);
+        self.clamp_focus();
 
-        // Keys.
+        // Command keys.
         if !self.sel.is_empty() {
-            if inp.pressed(KeyCode::KeyQ) {
+            if inp.pressed(KeyCode::KeyA) {
                 self.mode = Mode::AttackMove;
+                self.placing = None;
+            }
+            if inp.pressed(KeyCode::KeyQ) {
+                self.mode = Mode::Patrol;
+                self.placing = None;
             }
             if inp.pressed(KeyCode::KeyT) {
                 self.mode = Mode::Airlift;
+                self.placing = None;
             }
             if inp.pressed(KeyCode::KeyF) {
                 out.push(Command::Deploy { units: self.sel.clone() });
             }
-            if inp.pressed(KeyCode::KeyX) {
+            if inp.pressed(KeyCode::KeyS) || inp.pressed(KeyCode::KeyX) {
                 out.push(Command::Stop { units: self.sel.clone() });
+                self.mode = Mode::Normal;
             }
         }
         for (key, mode) in [(KeyCode::KeyR, Mode::Repair), (KeyCode::KeyV, Mode::Sell)] {
@@ -650,32 +688,14 @@ impl Game {
                 self.mode = Mode::Normal;
             } else {
                 self.sel.clear();
-                self.sel_struct = None;
+                self.sel_structs.clear();
             }
         }
-        const KEYS: [KeyCode; 9] = [
-            KeyCode::Digit1,
-            KeyCode::Digit2,
-            KeyCode::Digit3,
-            KeyCode::Digit4,
-            KeyCode::Digit5,
-            KeyCode::Digit6,
-            KeyCode::Digit7,
-            KeyCode::Digit8,
-            KeyCode::Digit9,
-        ];
-        for (i, k) in KEYS.iter().enumerate() {
-            if inp.pressed(*k) {
-                if ctrl {
-                    self.groups[i] = self.sel.clone();
-                } else if !self.groups[i].is_empty() {
-                    self.sel = self.groups[i].clone();
-                }
-            }
-        }
+        self.group_keys(inp, ctrl, shift);
 
         let (lp, rp) = (inp.mouse_pressed[0], inp.mouse_pressed[1]);
         if m.x >= vw {
+            self.cursor = Cursor::Normal;
             if lp || rp {
                 self.sidebar_click(m, lp, out);
             }
@@ -705,41 +725,29 @@ impl Game {
             } else if self.mode != Mode::Normal {
                 if inb(tile.0, tile.1) && !self.sel.is_empty() {
                     let units = self.sel.clone();
-                    out.push(match self.mode {
-                        Mode::Airlift => Command::Airlift { units, x: tile.0, y: tile.1 },
-                        _ => Command::Move { units, x: tile.0, y: tile.1, attack: true },
+                    out.push(match (self.mode, shift) {
+                        (Mode::Airlift, _) => Command::Airlift { units, x: tile.0, y: tile.1 },
+                        (Mode::Patrol, false) => Command::Patrol { units, x: tile.0, y: tile.1 },
+                        (Mode::Patrol, true) => Command::Queue { units, step: Step::Patrol(tile) },
+                        (_, false) => Command::Move { units, x: tile.0, y: tile.1, attack: true },
+                        (_, true) => Command::Queue { units, step: Step::AttackMove(tile) },
                     });
                     self.ack(m);
                 }
-                self.mode = Mode::Normal;
+                // Shift keeps the command armed for the next waypoint.
+                if !shift || self.mode == Mode::Airlift {
+                    self.mode = Mode::Normal;
+                }
             } else {
                 self.drag = Some(m);
             }
         }
         if inp.mouse_released[0] {
             if let Some(d0) = self.drag.take() {
-                let me = self.me;
-                if !shift {
-                    self.sel.clear();
-                }
-                self.sel_struct = None;
                 if d0.distance(m) < 6.0 {
-                    if let Some(id) = self.pick_unit(m, |u| u.owner == me) {
-                        if let Some(i) = self.sel.iter().position(|s| *s == id) {
-                            self.sel.remove(i);
-                        } else {
-                            self.sel.push(id);
-                        }
-                    } else if self.sel.is_empty() {
-                        self.sel_struct = self.own_struct_at(self.mouse_tile(m));
-                    }
+                    self.click_select(m, shift);
                 } else {
-                    let r = Rect::from_corners(d0, m);
-                    for u in self.world.units.values().filter(|u| u.owner == me && !u.carried) {
-                        if r.contains(self.proj(self.upos(u), Self::uz(u))) && !self.sel.contains(&u.id) {
-                            self.sel.push(u.id);
-                        }
-                    }
+                    self.box_select(Rect::from_corners(d0, m), shift);
                 }
             }
         }
@@ -747,16 +755,187 @@ impl Game {
             if self.placing.is_some() || self.mode != Mode::Normal {
                 self.placing = None;
                 self.mode = Mode::Normal;
-            } else if !self.sel.is_empty() && inb(tile.0, tile.1) {
-                self.context_order(m, tile, out);
-                self.ack(m);
-            } else if let Some(s) = self.sel_struct.and_then(|id| self.world.structs.get(&id)) {
-                if TRAIN_AT.contains(&s.kind) && inb(tile.0, tile.1) {
-                    out.push(Command::Rally { id: s.id, x: tile.0, y: tile.1 });
+            } else if inb(tile.0, tile.1) {
+                let ctx = self.context(m);
+                self.order(ctx, tile, shift, ctrl, alt, out);
+                if !matches!(ctx, Ctx::None | Ctx::Select) {
                     self.ack(m);
                 }
             }
         }
+        self.cursor = self.cursor_for(m, alt);
+    }
+
+    fn clamp_focus(&mut self) {
+        let (hx, hy) = (self.view_w() / 2.0 / self.k(), self.screen.y / 2.0 / (self.k() * PITCH_S));
+        let clamp = |v: f32, half: f32, size: f32| {
+            let (lo, hi) = (half - 5.0, size - half + 5.0);
+            if lo > hi {
+                size / 2.0
+            } else {
+                v.clamp(lo, hi)
+            }
+        };
+        self.focus.x = clamp(self.focus.x, hx, MAP_W as f32);
+        self.focus.y = clamp(self.focus.y, hy, MAP_H as f32);
+    }
+
+    /// 1-9 select a group (twice quickly: jump to it), Ctrl sets it, Shift adds to it.
+    fn group_keys(&mut self, inp: &InputSnap, ctrl: bool, shift: bool) {
+        const KEYS: [KeyCode; 9] = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+        for (i, k) in KEYS.iter().enumerate() {
+            if !inp.pressed(*k) {
+                continue;
+            }
+            if ctrl {
+                self.groups[i] = (self.sel.clone(), self.sel_structs.clone());
+            } else if shift {
+                let g = &mut self.groups[i];
+                g.0.extend(self.sel.iter().filter(|id| !g.0.contains(id)).copied().collect::<Vec<_>>());
+                g.1.extend(self.sel_structs.iter().filter(|id| !g.1.contains(id)).copied().collect::<Vec<_>>());
+            } else {
+                let (w, me) = (&self.world, self.me);
+                let g = &mut self.groups[i];
+                g.0.retain(|id| w.units.get(id).is_some_and(|u| u.owner == me));
+                g.1.retain(|id| w.structs.get(id).is_some_and(|s| s.owner == me));
+                if g.0.is_empty() && g.1.is_empty() {
+                    continue;
+                }
+                self.sel = g.0.clone();
+                self.sel_structs = g.1.clone();
+                self.mode = Mode::Normal;
+                let double = self.last_group_tap.is_some_and(|(j, t)| j == i && self.time - t < 0.35);
+                if double {
+                    if let Some(c) = self.selection_center() {
+                        self.focus = c;
+                    }
+                }
+                self.last_group_tap = Some((i, self.time));
+            }
+        }
+    }
+
+    /// Middle of the current selection, in tiles.
+    fn selection_center(&self) -> Option<Vec2> {
+        let mut pts: Vec<Vec2> = self.sel.iter().filter_map(|id| self.world.units.get(id)).map(|u| self.upos(u) / PX).collect();
+        for s in self.sel_structs.iter().filter_map(|id| self.world.structs.get(id)) {
+            let d = s.kind.def();
+            pts.push(Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0));
+        }
+        (!pts.is_empty()).then(|| pts.iter().copied().sum::<Vec2>() / pts.len() as f32)
+    }
+
+    fn on_view(&self, p: Vec2) -> bool {
+        p.x >= 0.0 && p.y >= 0.0 && p.x < self.view_w() && p.y < self.screen.y
+    }
+
+    /// Left click: a unit, else a building. Double click: every one of that kind on screen.
+    fn click_select(&mut self, m: Vec2, shift: bool) {
+        let me = self.me;
+        let double = self.last_click.is_some_and(|(p, t)| p.distance(m) < 8.0 && self.time - t < 0.35);
+        self.last_click = Some((m, self.time));
+        if let Some(id) = self.pick_unit(m, |u| u.owner == me) {
+            if !shift {
+                self.sel.clear();
+                self.sel_structs.clear();
+            }
+            if double {
+                let kind = self.world.units[&id].kind;
+                let same: Vec<u32> = self
+                    .world
+                    .units
+                    .values()
+                    .filter(|u| u.owner == me && u.kind == kind && !u.carried && self.on_view(self.proj(self.upos(u), Self::uz(u))))
+                    .map(|u| u.id)
+                    .collect();
+                for id in same {
+                    if !self.sel.contains(&id) {
+                        self.sel.push(id);
+                    }
+                }
+            } else if let Some(i) = self.sel.iter().position(|s| *s == id) {
+                self.sel.remove(i);
+            } else {
+                self.sel.push(id);
+            }
+            return;
+        }
+        let st = self.own_struct_at(self.mouse_tile(m));
+        if !shift {
+            self.sel.clear();
+            self.sel_structs.clear();
+        }
+        let Some(id) = st else { return };
+        if double {
+            let kind = self.world.structs[&id].kind;
+            let same: Vec<u32> = self
+                .world
+                .structs
+                .values()
+                .filter(|s| s.owner == me && s.kind == kind && self.on_view(self.proj(Self::struct_mid(s) * PX, 0.0)))
+                .map(|s| s.id)
+                .collect();
+            for id in same {
+                if !self.sel_structs.contains(&id) {
+                    self.sel_structs.push(id);
+                }
+            }
+        } else if let Some(i) = self.sel_structs.iter().position(|s| *s == id) {
+            self.sel_structs.remove(i);
+        } else {
+            self.sel_structs.push(id);
+        }
+    }
+
+    /// Drag box: own units inside; if there are none, own buildings inside.
+    fn box_select(&mut self, r: Rect, shift: bool) {
+        let me = self.me;
+        if !shift {
+            self.sel.clear();
+            self.sel_structs.clear();
+        }
+        let units: Vec<u32> = self
+            .world
+            .units
+            .values()
+            .filter(|u| u.owner == me && !u.carried && r.contains(self.proj(self.upos(u), Self::uz(u))))
+            .map(|u| u.id)
+            .collect();
+        if !units.is_empty() {
+            for id in units {
+                if !self.sel.contains(&id) {
+                    self.sel.push(id);
+                }
+            }
+            return;
+        }
+        let structs: Vec<u32> = self
+            .world
+            .structs
+            .values()
+            .filter(|s| s.owner == me && !s.kind.is_slab() && r.contains(self.proj(Self::struct_mid(s) * PX, 0.0)))
+            .map(|s| s.id)
+            .collect();
+        for id in structs {
+            if !self.sel_structs.contains(&id) {
+                self.sel_structs.push(id);
+            }
+        }
+    }
+
+    pub fn struct_mid(s: &Structure) -> Vec2 {
+        let d = s.kind.def();
+        Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0)
     }
 
     /// Order acknowledged: a quick ring where the click landed.
@@ -765,31 +944,133 @@ impl Game {
         self.fx.push(Fx::Ring { at, z: 0.0, t: 0.0, life: 0.25, r: 12.0 });
     }
 
-    fn context_order(&mut self, m: Vec2, tile: (i32, i32), out: &mut Vec<Command>) {
-        let (w, me) = (&self.world, self.me);
-        let units = self.sel.clone();
-        let of_kind = |k: UnitKind| -> Vec<u32> { units.iter().copied().filter(|id| w.units[id].kind == k).collect() };
-        let (harvs, carriers) = (of_kind(UnitKind::Harvester), of_kind(UnitKind::Carrier));
-        let st = w.structs.get(&w.structure_at[idx(tile.0, tile.1)]);
+    fn can_hit(&self, u: &Unit, target_air: bool) -> bool {
+        let d = u.kind.def();
+        d.damage > 0 && (!target_air || d.hits_air)
+    }
 
-        if let Some(id) = self.pick_unit(m, |u| u.owner != me) {
-            out.push(Command::Attack { units, target: Target::Unit(id) });
-        } else if let Some(s) = st.filter(|s| s.owner != me && self.ghosts.contains_key(&s.id)) {
-            out.push(Command::Attack { units, target: Target::Struct(s.id) });
-        } else if let Some(cargo) =
-            self.pick_unit(m, |u| u.owner == me && !u.kind.def().air).filter(|_| !carriers.is_empty())
-        {
-            out.push(Command::Pickup { units: carriers, cargo });
-        } else if st.is_some_and(|s| s.kind == StructKind::Refinery) && !harvs.is_empty() {
-            out.push(Command::Return { units: harvs });
-        } else if w.terrain[idx(tile.0, tile.1)] == Terrain::Ore && !harvs.is_empty() {
-            let rest: Vec<u32> = units.iter().copied().filter(|id| !harvs.contains(id)).collect();
-            out.push(Command::Harvest { units: harvs, x: tile.0, y: tile.1 });
-            if !rest.is_empty() {
-                out.push(Command::Move { units: rest, x: tile.0, y: tile.1, attack: false });
+    /// What a right click at `m` would do with the current selection. The cursor
+    /// shows exactly this, and `order` carries it out, so they cannot disagree.
+    pub fn context(&self, m: Vec2) -> Ctx {
+        let (w, me) = (&self.world, self.me);
+        let tile = self.mouse_tile(m);
+        let sel: Vec<&Unit> = self.sel.iter().filter_map(|id| w.units.get(id)).collect();
+        if sel.is_empty() {
+            let trainers = self.sel_structs.iter().filter_map(|id| w.structs.get(id)).any(|s| TRAIN_AT.contains(&s.kind));
+            if trainers {
+                return if inb(tile.0, tile.1) { Ctx::Rally } else { Ctx::None };
             }
-        } else {
-            out.push(Command::Move { units, x: tile.0, y: tile.1, attack: false });
+            let own_unit = self.pick_unit(m, |u| u.owner == me).is_some();
+            return if own_unit || self.own_struct_at(tile).is_some() { Ctx::Select } else { Ctx::None };
+        }
+        if !inb(tile.0, tile.1) {
+            return Ctx::None;
+        }
+        if let Some(id) = self.pick_unit(m, |u| u.owner != me) {
+            let air = w.units[&id].kind.def().air;
+            if sel.iter().any(|u| self.can_hit(u, air)) {
+                return Ctx::Attack(Target::Unit(id));
+            }
+        }
+        let st = w.structs.get(&w.structure_at[idx(tile.0, tile.1)]);
+        if let Some(s) = st.filter(|s| s.owner != me && self.ghosts.contains_key(&s.id)) {
+            if sel.iter().any(|u| self.can_hit(u, false)) {
+                return Ctx::Attack(Target::Struct(s.id));
+            }
+        }
+        let has = |k: UnitKind| sel.iter().any(|u| u.kind == k);
+        if has(UnitKind::Carrier) {
+            if let Some(cargo) = self.pick_unit(m, |u| u.owner == me && !u.kind.def().air) {
+                return Ctx::Pickup(cargo);
+            }
+        }
+        if has(UnitKind::Harvester) {
+            if st.is_some_and(|s| s.owner == me && s.kind == StructKind::Refinery) {
+                return Ctx::Return;
+            }
+            if w.terrain[idx(tile.0, tile.1)] == Terrain::Ore {
+                return Ctx::Harvest;
+            }
+        }
+        Ctx::Move
+    }
+
+    /// Right-click orders. Shift queues, Ctrl moves in formation, Alt attack-moves.
+    fn order(&mut self, ctx: Ctx, tile: (i32, i32), shift: bool, ctrl: bool, alt: bool, out: &mut Vec<Command>) {
+        let w = &self.world;
+        let units = self.sel.clone();
+        let (x, y) = tile;
+        let of_kind = |k: UnitKind| -> Vec<u32> { units.iter().copied().filter(|id| w.units[id].kind == k).collect() };
+        match ctx {
+            Ctx::None | Ctx::Select => {}
+            Ctx::Attack(target) => out.push(if shift {
+                Command::Queue { units, step: Step::Attack(target) }
+            } else {
+                Command::Attack { units, target }
+            }),
+            Ctx::Pickup(cargo) => out.push(Command::Pickup { units: of_kind(UnitKind::Carrier), cargo }),
+            Ctx::Return => out.push(Command::Return { units: of_kind(UnitKind::Harvester) }),
+            Ctx::Harvest => {
+                let harvs = of_kind(UnitKind::Harvester);
+                let rest: Vec<u32> = units.iter().copied().filter(|id| !harvs.contains(id)).collect();
+                if shift {
+                    out.push(Command::Queue { units: harvs, step: Step::Harvest(tile) });
+                    if !rest.is_empty() {
+                        out.push(Command::Queue { units: rest, step: Step::Move(tile) });
+                    }
+                } else {
+                    out.push(Command::Harvest { units: harvs, x, y });
+                    if !rest.is_empty() {
+                        out.push(Command::Move { units: rest, x, y, attack: false });
+                    }
+                }
+            }
+            Ctx::Move => out.push(match (shift, ctrl) {
+                (true, _) => Command::Queue { units, step: if alt { Step::AttackMove(tile) } else { Step::Move(tile) } },
+                (false, true) => Command::Formation { units, x, y, attack: alt },
+                (false, false) => Command::Move { units, x, y, attack: alt },
+            }),
+            Ctx::Rally => {
+                // The sim shares one gather point per building kind.
+                let mut kinds: Vec<StructKind> = Vec::new();
+                for s in self.sel_structs.iter().filter_map(|id| w.structs.get(id)) {
+                    if TRAIN_AT.contains(&s.kind) && !kinds.contains(&s.kind) {
+                        kinds.push(s.kind);
+                        out.push(Command::Rally { id: s.id, x, y });
+                    }
+                }
+            }
+        }
+    }
+
+    fn cursor_for(&self, m: Vec2, alt: bool) -> Cursor {
+        if self.drag.is_some_and(|d| d.distance(m) >= 6.0) || self.placing.is_some_and(|k| self.ready(k)) {
+            return Cursor::Normal;
+        }
+        let tile = self.mouse_tile(m);
+        match self.mode {
+            Mode::Repair => {
+                let damaged = self.own_struct_at(tile).and_then(|id| self.world.structs.get(&id)).is_some_and(|s| s.hp < s.kind.def().hp);
+                return if damaged { Cursor::Repair } else { Cursor::Deny };
+            }
+            Mode::Sell => return if self.own_struct_at(tile).is_some() { Cursor::Sell } else { Cursor::Deny },
+            _ if !inb(tile.0, tile.1) && self.mode != Mode::Normal => return Cursor::Deny,
+            Mode::AttackMove => return Cursor::AttackMove,
+            Mode::Patrol => return Cursor::Patrol,
+            Mode::Airlift => return Cursor::Airlift,
+            Mode::Normal => {}
+        }
+        match self.context(m) {
+            Ctx::Attack(_) => Cursor::Attack,
+            Ctx::Pickup(_) => Cursor::Pickup,
+            Ctx::Return => Cursor::Return,
+            Ctx::Harvest => Cursor::Harvest,
+            Ctx::Move if alt => Cursor::AttackMove,
+            Ctx::Move => Cursor::Move,
+            Ctx::Rally => Cursor::Rally,
+            Ctx::Select => Cursor::Select,
+            Ctx::None if !self.sel.is_empty() || !self.sel_structs.is_empty() => Cursor::Deny,
+            Ctx::None => Cursor::Normal,
         }
     }
 
@@ -832,7 +1113,8 @@ impl Game {
     /// Bottom-left hint line for the current mode / selection.
     pub fn hint(&self) -> String {
         match self.mode {
-            Mode::AttackMove => "ATTACK-MOVE  -  left click destination".to_string(),
+            Mode::AttackMove => "ATTACK-MOVE  -  left click destination  -  Shift: add waypoint".to_string(),
+            Mode::Patrol => "PATROL  -  left click the far end  -  Shift: queue it".to_string(),
             Mode::Airlift => "AIRLIFT  -  left click drop zone".to_string(),
             Mode::Repair => "REPAIR  -  left click own buildings to start / stop  -  right click when done".to_string(),
             Mode::Sell => "SELL  -  left click own buildings  -  right click when done".to_string(),
@@ -841,16 +1123,26 @@ impl Game {
             }
             Mode::Normal if !self.sel.is_empty() => {
                 let mcv = self.sel.iter().any(|id| self.world.units.get(id).is_some_and(|u| u.kind == UnitKind::Mcv));
-                let extra = if mcv { "   -   F deploy MCV (needs 3x3 clear rock)" } else { "" };
-                format!("{} selected   -   Q attack-move   -   T airlift   -   X stop{extra}", self.sel.len())
+                let extra = if mcv { "   F deploy" } else { "" };
+                format!(
+                    "{} selected   A attack-move   Q patrol   S stop   T airlift{extra}   |   Shift queue   Ctrl formation   Alt attack",
+                    self.sel.len()
+                )
             }
-            Mode::Normal => match self.sel_struct.and_then(|id| self.world.structs.get(&id)) {
-                Some(s) if TRAIN_AT.contains(&s.kind) => {
-                    format!("{}   -   right click the map to set the gather point", s.kind.def().name)
+            Mode::Normal => {
+                let structs: Vec<&Structure> = self.sel_structs.iter().filter_map(|id| self.world.structs.get(id)).collect();
+                match structs.as_slice() {
+                    [] => String::new(),
+                    [s] if TRAIN_AT.contains(&s.kind) => {
+                        format!("{}   -   right click the map to set the gather point", s.kind.def().name)
+                    }
+                    [s] => s.kind.def().name.to_string(),
+                    many if many.iter().any(|s| TRAIN_AT.contains(&s.kind)) => {
+                        format!("{} buildings   -   right click the map to set their gather point", many.len())
+                    }
+                    many => format!("{} buildings", many.len()),
                 }
-                Some(s) => s.kind.def().name.to_string(),
-                None => String::new(),
-            },
+            }
         }
     }
 

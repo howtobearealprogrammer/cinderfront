@@ -162,7 +162,7 @@ fn setup(
     ));
     commands.insert_resource(GlobalAmbientLight { color: Color::srgb(1.0, 0.92, 0.85), brightness: 600.0, ..default() });
 
-    let model = |name: &str| server.load(GltfAssetLabel::Scene(0).from_asset(format!("models/{name}.glb")));
+    let model = |name: &str| server.load(GltfAssetLabel::Scene(0).from_asset(format!("embedded://models/{name}.glb")));
     let units = UnitKind::ALL.iter().map(|k| (*k, model(unit_file(*k)))).collect();
     let structs = StructKind::BUILDABLE
         .iter()
@@ -604,8 +604,8 @@ fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>) {
         let at = world_pos(g.upos(u), Game::uz(u) + 1.0);
         gz.ellipse(ground_iso(at), Vec2::new(0.38, 0.3) * k, col(rgba(0.75, 1.0, 0.8, 0.95)));
     }
-    // Selected structure: footprint outline, rally flag.
-    if let Some(s) = g.sel_struct.and_then(|id| w.structs.get(&id)) {
+    // Selected structures: footprint outline, rally flag.
+    for s in g.sel_structs.iter().filter_map(|id| w.structs.get(id)) {
         let d = s.kind.def();
         let c = rgba(0.75, 1.0, 0.8, 0.95);
         let mid = Vec3::new(s.x as f32 + d.w as f32 / 2.0, 0.05, s.y as f32 + d.h as f32 / 2.0);
