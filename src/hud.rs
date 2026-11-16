@@ -16,7 +16,7 @@ impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MenuContent>()
             .add_systems(Startup, setup)
-            .add_systems(Update, (update_menu, update_hud, update_tools, update_icons, update_bars).after(crate::RunGame));
+            .add_systems(Update, (update_menu, update_hud, update_tools, update_icons, update_bars, update_pause).after(crate::RunGame));
     }
 }
 
@@ -76,6 +76,10 @@ struct IconPart(Slot, Role);
 
 #[derive(Component)]
 struct HintBox;
+#[derive(Component)]
+struct PausePanel;
+#[derive(Component)]
+struct PauseItem(usize);
 #[derive(Component)]
 struct HintText;
 #[derive(Component)]
@@ -168,6 +172,32 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
                 BorderColor::all(to_color(rgba(0.7, 1.0, 0.8, 0.9))),
                 Visibility::Hidden,
             ));
+            // Esc menu.
+            root.spawn((
+                PausePanel,
+                Node { border: UiRect::all(px(2)), ..abs(0.0, 0.0, 340.0, 290.0) },
+                bg(rgba(0.07, 0.08, 0.11, 0.96)),
+                BorderColor::all(to_color(team)),
+                GlobalZIndex(10),
+                Visibility::Hidden,
+            ))
+            .with_children(|m| {
+                m.spawn(label(&font, "MENU", 20.0, rgba(1.0, 0.84, 0.32, 1.0), 20.0, 14.0));
+                for (i, name) in crate::game::PAUSE_ITEMS.iter().enumerate() {
+                    m.spawn((
+                        PauseItem(i),
+                        Node {
+                            border: UiRect::all(px(1.5)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..abs(18.0, 54.0 + i as f32 * 50.0, 300.0, 42.0)
+                        },
+                        bg(rgba(0.17, 0.19, 0.23, 1.0)),
+                        BorderColor::all(to_color(rgba(0.36, 0.38, 0.44, 1.0))),
+                    ))
+                    .with_child(text(&font, name, 16.0, rgba(0.94, 0.95, 0.98, 1.0)));
+                }
+            });
             root.spawn((HintBox, abs(10.0, 0.0, 10.0, 26.0), bg(rgba(0.03, 0.04, 0.06, 0.72)), Visibility::Hidden))
                 .with_children(|h| {
                     h.spawn((abs(0.0, 0.0, 3.0, 26.0), bg(team)));
@@ -459,7 +489,7 @@ fn update_hud(
     if let Some(e) = banner_sub {
         let sub = match g.menu_in {
             Some(t) => format!("Returning to the main menu in {}", t.ceil().max(0.0) as i32),
-            None if over.is_some() => "Keep watching, or press Esc to leave the match".to_string(),
+            None if over.is_some() => "Keep watching, or press Esc for the menu".to_string(),
             None => String::new(),
         };
         if let Ok((mut txt, _)) = texts.p4().get_mut(e) {
@@ -665,6 +695,41 @@ fn hp_color(frac: f32) -> Rgba {
         rgba(1.0, 0.8, 0.15, 1.0)
     } else {
         rgba(1.0, 0.25, 0.15, 1.0)
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn update_pause(
+    view: Res<View>,
+    mut panel: Query<(&mut Node, &mut Visibility), (With<PausePanel>, Without<PauseItem>)>,
+    mut items: Query<(&PauseItem, &mut BackgroundColor, &mut BorderColor, &Children), Without<PausePanel>>,
+    mut texts: Query<(&mut Text, &mut TextColor)>,
+) {
+    let Some(g) = &view.0 else { return };
+    let Ok((mut n, mut v)) = panel.single_mut() else { return };
+    let Some(pm) = g.pause else {
+        v.set_if_neq(Visibility::Hidden);
+        return;
+    };
+    v.set_if_neq(Visibility::Inherited);
+    let r = g.pause_rect(0);
+    n.left = px(r.min.x - 20.0);
+    n.top = px(r.min.y - 56.0);
+    for (item, mut c, mut b, children) in &mut items {
+        let (on, ok) = (item.0 == pm.sel, pm.enabled(item.0));
+        c.0 = to_color(if on && ok { rgba(0.24, 0.30, 0.40, 1.0) } else { rgba(0.17, 0.19, 0.23, 1.0) });
+        *b = BorderColor::all(to_color(if on && ok { PCOL[g.me as usize % 4] } else { rgba(0.36, 0.38, 0.44, 1.0) }));
+        if let Some((mut t, mut tc)) = children.first().and_then(|e| texts.get_mut(*e).ok()) {
+            let label = match item.0 {
+                1 if !ok => "Restart map  (solo only)".to_string(),
+                0 if pm.paused => "Resume  (paused)".to_string(),
+                i => crate::game::PAUSE_ITEMS[i].to_string(),
+            };
+            if t.0 != label {
+                t.0 = label;
+            }
+            tc.0 = to_color(if ok { rgba(0.94, 0.95, 0.98, 1.0) } else { rgba(0.5, 0.5, 0.54, 1.0) });
+        }
     }
 }
 

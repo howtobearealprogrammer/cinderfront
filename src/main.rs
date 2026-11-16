@@ -13,7 +13,7 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::window::{CursorGrabMode, CursorOptions, MonitorSelection, PrimaryWindow, WindowMode, WindowResolution};
 use cinderfront::net::{self, Conn, Finder, Host, C2H, H2C};
 use cinderfront::sim::{Command, StructKind, UnitKind, World, TICKS_PER_SEC};
-use game::{Game, InputSnap};
+use game::{Game, InputSnap, PauseMenu, PAUSE_ITEMS};
 use gfx::{rgba, Rgba};
 use hud::MenuContent;
 use scene::View;
@@ -60,6 +60,8 @@ struct Play {
     auto: Option<u8>,
     /// Seconds since the match was decided.
     over: Option<f32>,
+    /// Solo games can be restarted from the Esc menu (true = the demo sandbox).
+    restart: Option<bool>,
 }
 
 impl Play {
@@ -75,6 +77,7 @@ impl Play {
             hashes: BTreeMap::new(),
             auto: std::env::var_os("CF_AUTOPLAY").map(|_| 0),
             over: None,
+            restart: None,
         }
     }
 
@@ -236,7 +239,9 @@ fn join(addr: &str) -> Screen {
 
 fn solo(view: &mut View) -> Screen {
     view.0 = Some(Game::new(World::new(MAP_SEED, 2), 0));
-    Screen::Play(Box::new(Play::new(Net::Solo)))
+    let mut p = Play::new(Net::Solo);
+    p.restart = Some(false);
+    Screen::Play(Box::new(p))
 }
 
 /// Sandbox with one of everything, for eyeballing the renderer.
@@ -269,7 +274,9 @@ fn demo(view: &mut View) -> Screen {
         g.zoom = z;
     }
     view.0 = Some(g);
-    Screen::Play(Box::new(Play::new(Net::Solo)))
+    let mut p = Play::new(Net::Solo);
+    p.restart = Some(true);
+    Screen::Play(Box::new(p))
 }
 
 fn line(s: impl Into<String>, size: f32, c: Rgba) -> (String, f32, Rgba) {
@@ -288,6 +295,7 @@ fn run_session(
     scroll: Res<AccumulatedMouseScroll>,
     mut typed: MessageReader<KeyboardInput>,
     windows: Query<&Window>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let dt = time.delta_secs().min(0.25);
     let Session { screen, background } = &mut *session;
@@ -301,6 +309,7 @@ fn run_session(
         }
     }
     let mut leave = false;
+    let mut restart: Option<bool> = None;
     let (white, light, gray, red, orange) = (
         rgba(1.0, 1.0, 1.0, 1.0),
         rgba(0.78, 0.78, 0.78, 1.0),
@@ -340,7 +349,7 @@ fn run_session(
             let mut lines = vec![
                 line("CINDERFRONT", 80.0, orange),
                 line("", 10.0, white),
-                line("[H] Host LAN game     [J] Join     [S] Solo sandbox", 28.0, white),
+                line("[H] Host LAN game     [J] Join     [S] Solo sandbox     [Q] Quit", 28.0, white),
                 line(format!("Join address (type, blank = first found): {}_", m.ip), 24.0, light),
                 line(format!("Hosts on LAN: {found}"), 24.0, light),
                 line(m.msg.clone(), 24.0, red),
@@ -368,7 +377,9 @@ fn run_session(
             ];
             lines.extend(help.iter().map(|h| line(*h, 22.0, gray)));
             menu_out.lines = lines;
-            if keys.just_pressed(KeyCode::KeyH) && background.is_some() {
+            if keys.just_pressed(KeyCode::KeyQ) {
+                exit.write(AppExit::Success);
+            } else if keys.just_pressed(KeyCode::KeyH) && background.is_some() {
                 m.msg = "Can't host a new game until your last match finishes".into();
             } else if keys.just_pressed(KeyCode::KeyH) {
                 next = Some(host(net::TCP_PORT, 0));
@@ -462,10 +473,51 @@ fn run_session(
                 inp.mouse_pressed[i] = mouse.just_pressed(b);
                 inp.mouse_released[i] = mouse.just_released(b);
             }
-            p.frame(g, &mut status.0, dt, &inp);
-            // Knocked out while others play on: Esc leaves.
-            let out = g.world.players[g.me as usize].defeated && g.world.winner.is_none();
-            leave = out && keys.just_pressed(KeyCode::Escape);
+            let mut action = None;
+            if let Some(mut pm) = g.pause {
+                // The menu has the keyboard and mouse; the game underneath gets nothing.
+                let m = inp.mouse;
+                g.screen = inp.screen;
+                for i in 0..PAUSE_ITEMS.len() {
+                    if g.pause_rect(i).contains(m) && m != g.mouse {
+                        pm.sel = i;
+                    }
+                }
+                let n = PAUSE_ITEMS.len();
+                if keys.just_pressed(KeyCode::ArrowDown) {
+                    pm.sel = (pm.sel + 1) % n;
+                }
+                if keys.just_pressed(KeyCode::ArrowUp) {
+                    pm.sel = (pm.sel + n - 1) % n;
+                }
+                let clicked = inp.mouse_pressed[0] && g.pause_rect(pm.sel).contains(m);
+                if keys.just_pressed(KeyCode::Escape) {
+                    action = Some(0);
+                } else if (clicked || keys.just_pressed(KeyCode::Enter)) && pm.enabled(pm.sel) {
+                    action = Some(pm.sel);
+                }
+                g.pause = Some(pm);
+                g.mouse = m;
+                inp = InputSnap { mouse: m, screen: inp.screen, ..default() };
+            }
+            let frozen = g.pause.is_some_and(|pm| pm.paused);
+            p.frame(g, &mut status.0, if frozen { 0.0 } else { dt }, &inp);
+            if g.pause.is_some() {
+                g.cursor = game::Cursor::Normal;
+            }
+            if std::mem::take(&mut g.menu_request) && g.pause.is_none() {
+                let solo = matches!(p.net, Net::Solo);
+                g.pause = Some(PauseMenu { sel: 0, can_restart: p.restart.is_some(), paused: solo });
+            }
+            match action {
+                Some(0) => g.pause = None,
+                Some(1) => restart = p.restart,
+                Some(2) => leave = true,
+                Some(3) => {
+                    exit.write(AppExit::Success);
+                }
+                _ => {}
+            }
             // Once someone has won, show the result for a few seconds, then back to the menu.
             if g.world.winner.is_some() {
                 let t = p.over.get_or_insert(0.0);
@@ -481,12 +533,20 @@ fn run_session(
     if leave {
         if let Screen::Play(p) = std::mem::replace(screen, menu("")) {
             let game = view.0.take();
-            // A host has to keep relaying turns, so its match carries on in the background.
-            if let (Net::Host(_), Some(g)) = (&p.net, game) {
-                *background = Some((p, g));
+            // A host has to keep relaying turns, so an undecided match with players
+            // still connected carries on in the background.
+            if let (Net::Host(h), Some(mut g)) = (&p.net, game) {
+                if g.world.winner.is_none() && h.clients.iter().any(|c| c.open) {
+                    g.pause = None;
+                    *background = Some((p, g));
+                }
             }
         }
         status.0.clear();
+    }
+    if let Some(demo_map) = restart {
+        status.0.clear();
+        next = Some(if demo_map { demo(&mut view) } else { solo(&mut view) });
     }
     if let Some(n) = next {
         if !matches!(n, Screen::Play(_)) {

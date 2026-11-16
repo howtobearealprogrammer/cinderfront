@@ -44,6 +44,22 @@ pub enum Mode {
     Sell,
 }
 
+/// The Esc menu. `paused` freezes a solo game; network games keep running.
+#[derive(Clone, Copy)]
+pub struct PauseMenu {
+    pub sel: usize,
+    pub can_restart: bool,
+    pub paused: bool,
+}
+
+pub const PAUSE_ITEMS: [&str; 4] = ["Resume", "Restart map", "Exit to main menu", "Quit to desktop"];
+
+impl PauseMenu {
+    pub fn enabled(&self, i: usize) -> bool {
+        i != 1 || self.can_restart
+    }
+}
+
 /// What a right click would do right now (see `Game::context`).
 #[derive(Clone, Copy, PartialEq)]
 pub enum Ctx {
@@ -162,6 +178,10 @@ pub struct Game {
     pub show_tech: bool,
     /// Seconds until the finished match closes (set by the session).
     pub menu_in: Option<f32>,
+    /// Esc was pressed with nothing to cancel.
+    pub menu_request: bool,
+    /// The in-game (Esc) menu, while open.
+    pub pause: Option<PauseMenu>,
     rng: Rng,
 }
 
@@ -205,6 +225,8 @@ impl Game {
             ghosts: HashMap::new(),
             show_tech: false,
             menu_in: None,
+            menu_request: false,
+            pause: None,
             rng: Rng::new(0x1234_5678 ^ me as u32),
         };
         g.center_on(g.world.starts[me as usize]);
@@ -535,6 +557,13 @@ impl Game {
         let p = Vec2::new(self.view_w() + 8.0 + i as f32 * 104.0, TOOL_Y);
         Rect::from_corners(p, p + Vec2::new(100.0, 22.0))
     }
+    /// Screen rectangle of an Esc-menu entry (centred in the map view).
+    pub fn pause_rect(&self, i: usize) -> Rect {
+        let top = self.screen.y / 2.0 - 110.0;
+        let p = Vec2::new(self.view_w() / 2.0 - 150.0, top + 56.0 + i as f32 * 50.0);
+        Rect::from_corners(p, p + Vec2::new(300.0, 42.0))
+    }
+
     /// Ground rectangle (tiles) the view currently shows.
     pub fn view_ground(&self) -> Rect {
         Rect::from_corners(self.ground_at(Vec2::ZERO), self.ground_at(Vec2::new(self.view_w(), self.screen.y)))
@@ -690,8 +719,8 @@ impl Game {
                 self.placing = None;
                 self.mode = Mode::Normal;
             } else {
-                self.sel.clear();
-                self.sel_structs.clear();
+                // Nothing to cancel: the session opens the in-game menu.
+                self.menu_request = true;
             }
         }
         self.group_keys(inp, ctrl, shift);
