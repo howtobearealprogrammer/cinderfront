@@ -1,8 +1,8 @@
 //! Screen-space UI: menus, sidebar (minimap, credits, power, build and train
-//! buttons), health bars, hint line, tech tree and end-of-game banner.
+//! buttons), hint line, tech tree, Esc menu and end-of-game banner.
 //! Layout constants and click handling live in `game.rs`; this only draws.
 
-use crate::game::{struct_height, Game, Mode, MM, PCOL, PX, SIDE};
+use crate::game::{Game, Mode, MM, PCOL, SIDE};
 use crate::gfx::{fade, hash2, rgba, rgba_image, shade, to_color, Rgba};
 use crate::scene::{struct_file, unit_file, View};
 use bevy::asset::RenderAssetUsages;
@@ -16,7 +16,7 @@ impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MenuContent>()
             .add_systems(Startup, setup)
-            .add_systems(Update, (update_menu, update_hud, update_tools, update_icons, update_bars, update_pause).after(crate::RunGame));
+            .add_systems(Update, (update_menu, update_hud, update_tools, update_icons, update_pause).after(crate::RunGame));
     }
 }
 
@@ -31,7 +31,6 @@ pub struct MenuContent {
 struct HudRes {
     minimap: Handle<Image>,
     mm_timer: f32,
-    bars: Vec<(Entity, Entity)>,
 }
 
 #[derive(Component)]
@@ -150,21 +149,9 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
 
     let team = rgba(0.22, 0.52, 0.98, 1.0);
     let label_c = rgba(0.6, 0.62, 0.68, 1.0);
-    let mut bars = Vec::new();
     commands
         .spawn((GameRoot, Node { width: percent(100), height: percent(100), ..default() }, Visibility::Hidden))
         .with_children(|root| {
-            // Health bars (pooled; placed every frame).
-            for _ in 0..160 {
-                let mut fill = Entity::PLACEHOLDER;
-                let back = root
-                    .spawn((abs(0.0, 0.0, 20.0, 6.0), bg(rgba(0.0, 0.0, 0.0, 0.8)), Visibility::Hidden))
-                    .with_children(|b| {
-                        fill = b.spawn((abs(1.0, 1.0, 10.0, 4.0), bg(rgba(0.3, 0.95, 0.35, 1.0)))).id();
-                    })
-                    .id();
-                bars.push((back, fill));
-            }
             root.spawn((
                 DragRect,
                 Node { border: UiRect::all(px(1.5)), ..abs(0.0, 0.0, 0.0, 0.0) },
@@ -313,7 +300,7 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
                 }
             });
         });
-    commands.insert_resource(HudRes { minimap: mm, mm_timer: 0.0, bars });
+    commands.insert_resource(HudRes { minimap: mm, mm_timer: 0.0 });
 }
 
 fn tech_rows() -> Vec<(StructKind, String)> {
@@ -366,14 +353,24 @@ fn update_menu(
         match menu.lines.get(l.0) {
             Some((s, size, col)) => {
                 if t.0 != *s {
-                    t.0 = s.clone();
+                    put(&mut t, |x| x.0 = s.clone());
                 }
-                f.font_size = FontSize::Px(*size);
-                c.0 = to_color(*col);
-                node.display = Display::Flex;
+                put(&mut f, |x| x.font_size = FontSize::Px(*size));
+                put(&mut c, |x| x.0 = to_color(*col));
+                put(&mut node, |x| x.display = Display::Flex);
             }
             None => node.display = Display::None,
         }
+    }
+}
+
+/// Write a component only when the value really changes. Bevy re-lays-out the
+/// whole UI tree (and re-shapes text) whenever a Node or Text is touched.
+fn put<T: PartialEq + Clone>(m: &mut Mut<T>, f: impl FnOnce(&mut T)) {
+    let mut v = (**m).clone();
+    f(&mut v);
+    if **m != v {
+        **m = v;
     }
 }
 
@@ -413,7 +410,7 @@ fn update_hud(
     let Some(g) = &view.0 else { return };
     let (vw, sh) = (g.view_w(), g.screen.y);
     if let Ok(mut n) = nodes.p0().single_mut() {
-        n.left = px(vw);
+        put(&mut n, |x| x.left = px(vw));
     }
 
     // Minimap image, refreshed a few times a second.
@@ -429,44 +426,44 @@ fn update_hud(
     let (x0, y0) = ((r.min.x * k).max(0.0), (r.min.y * k).max(0.0));
     let (x1, y1) = ((r.max.x * k).min(MM), (r.max.y * k).min(MM));
     if let Ok(mut n) = nodes.p1().single_mut() {
-        set_box(&mut n, x0, y0, x1 - x0, y1 - y0);
+        put(&mut n, |x| set_box(x, x0, y0, x1 - x0, y1 - y0));
     }
 
     // Credits and power.
     let pl = &g.world.players[g.me as usize];
     if let Ok(mut t) = texts.p0().single_mut() {
-        t.0 = format!("{:>8}", g.shown_credits.round() as i32);
+        put(&mut t, |x| x.0 = format!("{:>8}", g.shown_credits.round() as i32));
     }
     let low = pl.power_used > pl.power_made;
     let cap = pl.power_made.max(pl.power_used).max(1) as f32;
     let bw = SIDE - 72.0;
     let pc = if low { fade(rgba(1.0, 0.25, 0.2, 1.0), 0.6 + 0.4 * (g.time * 8.0).sin()) } else { rgba(0.3, 0.85, 1.0, 1.0) };
     if let Ok((mut n, mut c)) = nodes.p2().single_mut() {
-        n.width = px(bw * pl.power_used as f32 / cap);
-        c.0 = to_color(pc);
+        put(&mut n, |x| x.width = px(bw * pl.power_used as f32 / cap));
+        put(&mut c, |x| x.0 = to_color(pc));
     }
     if let Ok(mut n) = nodes.p3().single_mut() {
-        n.left = px(bw * pl.power_made as f32 / cap);
+        put(&mut n, |x| x.left = px(bw * pl.power_made as f32 / cap));
     }
     if let Ok(mut t) = texts.p1().single_mut() {
-        t.0 = format!("{} / {}", pl.power_used, pl.power_made);
+        put(&mut t, |x| x.0 = format!("{} / {}", pl.power_used, pl.power_made));
     }
 
     // Hint line.
     let hint = g.hint();
     if let Ok((mut n, mut v)) = nodes.p4().single_mut() {
-        n.top = px(sh - 34.0);
-        n.width = px(hint.chars().count() as f32 * 8.4 + 24.0);
+        put(&mut n, |x| x.top = px(sh - 34.0));
+        put(&mut n, |x| x.width = px(hint.chars().count() as f32 * 8.4 + 24.0));
         v.set_if_neq(if hint.is_empty() { Visibility::Hidden } else { Visibility::Inherited });
     }
     if let Ok(mut t) = texts.p2().single_mut() {
         if t.0 != hint {
-            t.0 = hint;
+            put(&mut t, |x| x.0 = hint);
         }
     }
     if let Ok(mut t) = texts.p3().single_mut() {
         if t.0 != status.0 {
-            t.0 = status.0.clone();
+            put(&mut t, |x| x.0 = status.0.clone());
         }
     }
 
@@ -480,8 +477,8 @@ fn update_hud(
     };
     let (mut banner_text, mut banner_sub) = (None, None);
     if let Ok((mut n, mut v, children)) = nodes.p5().single_mut() {
-        n.top = px(sh * 0.4 - 105.0);
-        n.width = px(vw);
+        put(&mut n, |x| x.top = px(sh * 0.4 - 105.0));
+        put(&mut n, |x| x.width = px(vw));
         v.set_if_neq(if over.is_some() { Visibility::Inherited } else { Visibility::Hidden });
         banner_text = children.first().copied();
         banner_sub = children.get(1).copied();
@@ -494,27 +491,27 @@ fn update_hud(
         };
         if let Ok((mut txt, _)) = texts.p4().get_mut(e) {
             if txt.0 != sub {
-                txt.0 = sub;
+                put(&mut txt, |x| x.0 = sub);
             }
         }
     }
     if let (Some((s, c)), Some(e)) = (over, banner_text) {
         if let Ok((mut t, mut tc)) = texts.p4().get_mut(e) {
-            t.0 = s.to_string();
-            tc.0 = to_color(c);
+            put(&mut t, |x| x.0 = s.to_string());
+            put(&mut tc, |x| x.0 = to_color(c));
         }
     }
 
     // Tech tree.
     if let Ok((mut n, mut v)) = nodes.p6().single_mut() {
-        n.left = px(((vw - 720.0) / 2.0).max(10.0));
-        n.top = px(60.0);
+        put(&mut n, |x| x.left = px(((vw - 720.0) / 2.0).max(10.0)));
+        put(&mut n, |x| x.top = px(60.0));
         v.set_if_neq(if g.show_tech { Visibility::Inherited } else { Visibility::Hidden });
     }
     if g.show_tech {
         for (row, mut c) in &mut texts.p5() {
             let have = g.world.has_struct(g.me, row.0);
-            c.0 = to_color(if have { rgba(0.5, 1.0, 0.6, 1.0) } else { rgba(0.72, 0.74, 0.8, 1.0) });
+            put(&mut c, |x| x.0 = to_color(if have { rgba(0.5, 1.0, 0.6, 1.0) } else { rgba(0.72, 0.74, 0.8, 1.0) }));
         }
     }
 
@@ -523,7 +520,7 @@ fn update_hud(
     if let Ok((mut n, mut v)) = nodes.p7().single_mut() {
         match g.drag.filter(|d0| d0.distance(m) >= 6.0) {
             Some(d0) => {
-                set_box(&mut n, d0.x.min(m.x), d0.y.min(m.y), (d0.x - m.x).abs(), (d0.y - m.y).abs());
+                put(&mut n, |x| set_box(x, d0.x.min(m.x), d0.y.min(m.y), (d0.x - m.x).abs(), (d0.y - m.y).abs()));
                 v.set_if_neq(Visibility::Inherited);
             }
             None => {
@@ -541,8 +538,8 @@ fn update_tools(view: Res<View>, mut tools: Query<(&ToolBtn, &mut BackgroundColo
         let (mode, col) = if b.0 == 0 { (Mode::Repair, rgba(0.35, 1.0, 0.45, 1.0)) } else { (Mode::Sell, rgba(1.0, 0.82, 0.3, 1.0)) };
         let on = g.mode == mode;
         let k = if on { 1.0 } else if g.tool_rect(b.0).contains(m) { 0.5 } else { 0.28 };
-        c.0 = to_color(fade(shade(col, 0.5), k));
-        *border = BorderColor::all(to_color(if on { col } else { rgba(0.36, 0.38, 0.44, 1.0) }));
+        put(&mut c, |x| x.0 = to_color(fade(shade(col, 0.5), k)));
+        border.set_if_neq(BorderColor::all(to_color(if on { col } else { rgba(0.36, 0.38, 0.44, 1.0) })));
     }
 
 }
@@ -581,7 +578,7 @@ fn update_icons(
                 let ready = tag == "READY";
                 let k = if hover { 1.35 } else { 1.0 };
                 if let Some(mut c) = bgc {
-                    c.0 = to_color(shade(rgba(0.17, 0.19, 0.23, 1.0), k));
+                    put(&mut c, |x| x.0 = to_color(shade(rgba(0.17, 0.19, 0.23, 1.0), k)));
                 }
                 let bc = if ready {
                     fade(rgba(0.4, 1.0, 0.55, 1.0), 0.6 + 0.4 * (g.time * 6.0).sin())
@@ -591,11 +588,11 @@ fn update_icons(
                     rgba(0.36, 0.38, 0.44, 1.0)
                 };
                 if let Some(mut b) = border {
-                    *b = BorderColor::all(to_color(bc));
+                    b.set_if_neq(BorderColor::all(to_color(bc)));
                 }
-                node.border = UiRect::all(px(if ready || hover { 3.0 } else { 1.5 }));
+                put(&mut node, |x| x.border = UiRect::all(px(if ready || hover { 3.0 } else { 1.5 })));
             }
-            Role::Progress => node.width = px(97.0 * progress.unwrap_or(0.0).clamp(0.0, 1.0)),
+            Role::Progress => put(&mut node, |n| n.width = px(97.0 * progress.unwrap_or(0.0).clamp(0.0, 1.0))),
             Role::Shade => {
                 if let Some(mut v) = vis {
                     v.set_if_neq(if enabled { Visibility::Hidden } else { Visibility::Inherited });
@@ -608,21 +605,21 @@ fn update_icons(
                         None => (format!("${cost}"), if enabled { rgba(1.0, 0.82, 0.3, 1.0) } else { rgba(0.5, 0.45, 0.3, 1.0) }),
                     };
                     if t.0 != s {
-                        t.0 = s;
+                        put(&mut t, |x| x.0 = s);
                     }
-                    c.0 = to_color(col);
+                    put(&mut c, |x| x.0 = to_color(col));
                 }
             }
             Role::Tag => {
                 if let Some(mut t) = text {
                     if t.0 != tag {
-                        t.0 = tag;
+                        put(&mut t, |x| x.0 = tag);
                     }
                 }
             }
             Role::Name => {
                 if let Some(mut c) = tcol {
-                    c.0 = to_color(if enabled { rgba(0.94, 0.95, 0.98, 1.0) } else { rgba(0.5, 0.5, 0.54, 1.0) });
+                    put(&mut c, |x| x.0 = to_color(if enabled { rgba(0.94, 0.95, 0.98, 1.0) } else { rgba(0.5, 0.5, 0.54, 1.0) }));
                 }
             }
         }
@@ -688,16 +685,6 @@ fn draw_minimap(g: &Game, img: &mut Image) {
     }
 }
 
-fn hp_color(frac: f32) -> Rgba {
-    if frac > 0.5 {
-        rgba(0.3, 0.95, 0.35, 1.0)
-    } else if frac > 0.25 {
-        rgba(1.0, 0.8, 0.15, 1.0)
-    } else {
-        rgba(1.0, 0.25, 0.15, 1.0)
-    }
-}
-
 #[allow(clippy::type_complexity)]
 fn update_pause(
     view: Res<View>,
@@ -729,51 +716,6 @@ fn update_pause(
                 t.0 = label;
             }
             tc.0 = to_color(if ok { rgba(0.94, 0.95, 0.98, 1.0) } else { rgba(0.5, 0.5, 0.54, 1.0) });
-        }
-    }
-}
-
-fn update_bars(view: Res<View>, hud: Res<HudRes>, mut q: Query<(&mut Node, &mut Visibility, Option<&mut BackgroundColor>)>) {
-    let mut want: Vec<(Vec2, f32, f32)> = Vec::new();
-    if let Some(g) = &view.0 {
-        let zm = g.zoom.max(0.8);
-        let vw = g.view_w();
-        for u in g.world.units.values().filter(|u| !u.carried && g.unit_visible(u)) {
-            let frac = u.hp as f32 / u.kind.def().hp as f32;
-            let sel = g.sel.contains(&u.id);
-            if sel || frac < 1.0 {
-                let p = g.proj(g.upos(u), Game::uz(u) + 30.0);
-                want.push((p, if sel { 26.0 } else { 22.0 } * zm, frac));
-            }
-        }
-        for s in g.shown_structs() {
-            let d = s.kind.def();
-            let frac = s.hp as f32 / d.hp.max(1) as f32;
-            if frac < 1.0 && d.hp > 0 {
-                let c = Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0) * PX;
-                let p = g.proj(c, (struct_height(s.kind) + 0.45) * PX);
-                want.push((p, (d.w as f32 * PX * 0.7 * g.zoom).max(20.0), frac));
-            }
-        }
-        want.retain(|(p, _, _)| p.x > -40.0 && p.x < vw + 10.0 && p.y > -20.0 && p.y < g.screen.y + 20.0);
-    }
-    for (i, (back, fill)) in hud.bars.iter().enumerate() {
-        match want.get(i) {
-            Some((p, w, frac)) => {
-                if let Ok((mut n, mut v, _)) = q.get_mut(*back) {
-                    set_box(&mut n, (p.x - w / 2.0).round(), p.y.round(), w + 2.0, 6.0);
-                    v.set_if_neq(Visibility::Inherited);
-                }
-                if let Ok((mut n, _, Some(mut c))) = q.get_mut(*fill) {
-                    n.width = px(w * frac.clamp(0.0, 1.0));
-                    c.0 = to_color(hp_color(*frac));
-                }
-            }
-            None => {
-                if let Ok((_, mut v, _)) = q.get_mut(*back) {
-                    v.set_if_neq(Visibility::Hidden);
-                }
-            }
         }
     }
 }

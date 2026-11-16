@@ -188,7 +188,10 @@ impl Play {
         for cmd in cmds {
             match &mut self.net {
                 Net::Client(c) => c.send(&C2H::Cmd(cmd)),
-                _ => self.pending.push((me, cmd)),
+                // Nobody to stay in lockstep with: act on orders at once instead of
+                // waiting for the next turn (up to 150 ms of input lag otherwise).
+                Net::Solo => game.world.apply(me, &cmd),
+                Net::Host(_) => self.pending.push((me, cmd)),
             }
         }
     }
@@ -556,6 +559,22 @@ fn run_session(
     }
 }
 
+/// CF_PERF=1: every 2 s, log average / worst frame time and FPS to stderr.
+fn perf_log(time: Res<Time<Real>>, mut acc: Local<(f32, f32, u32)>) {
+    if std::env::var_os("CF_PERF").is_none() {
+        return;
+    }
+    let dt = time.delta_secs();
+    acc.0 += dt;
+    acc.1 = acc.1.max(dt);
+    acc.2 += 1;
+    if acc.0 >= 2.0 {
+        let avg = acc.0 / acc.2 as f32;
+        eprintln!("PERF avg {:.2} ms  worst {:.2} ms  {:.0} fps", avg * 1000.0, acc.1 * 1000.0, 1.0 / avg);
+        *acc = (0.0, 0.0, 0);
+    }
+}
+
 /// In fullscreen the pointer stays on this window (so edge scrolling works with
 /// a second monitor); windowed or unfocused, it is free.
 fn confine_cursor(mut windows: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>) {
@@ -607,7 +626,7 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     // Fullscreen by default; `--windowed` (or a screenshot run) opens a 1280x800 window.
-    let windowed = args.iter().any(|a| a == "--windowed") || std::env::var_os("CF_SHOT").is_some();
+    let windowed = args.iter().any(|a| a == "--windowed") || std::env::var_os("CF_SHOT").is_some() || std::env::var_os("CF_RES").is_some();
     let args: Vec<String> = args.into_iter().filter(|a| a != "--windowed").collect();
     let mut view = View::default();
     let screen = match args.get(1).map(|s| s.as_str()) {
@@ -621,7 +640,10 @@ fn main() {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Cinderfront".into(),
-                resolution: WindowResolution::new(1280, 800),
+                resolution: std::env::var("CF_RES")
+                    .ok()
+                    .and_then(|r| r.split_once('x').and_then(|(w, h)| Some(WindowResolution::new(w.parse().ok()?, h.parse().ok()?))))
+                    .unwrap_or(WindowResolution::new(1280, 800)),
                 mode: if windowed { WindowMode::Windowed } else { WindowMode::BorderlessFullscreen(MonitorSelection::Primary) },
                 ..default()
             }),
@@ -640,6 +662,6 @@ fn main() {
         .init_resource::<Status>()
         .add_plugins((scene::ScenePlugin, hud::HudPlugin, cursor::CursorPlugin))
         .add_systems(Update, run_session.in_set(RunGame))
-        .add_systems(Update, (auto_shot, toggle_fullscreen, confine_cursor))
+        .add_systems(Update, (auto_shot, toggle_fullscreen, confine_cursor, perf_log))
         .run();
 }

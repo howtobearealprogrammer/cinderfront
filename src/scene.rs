@@ -24,6 +24,7 @@ pub struct ScenePlugin;
 impl Plugin for ScenePlugin {
     fn build(&self, app: &mut App) {
         app.init_gizmo_group::<OverlayGizmos>()
+            .init_gizmo_group::<BarGizmos>()
             .add_systems(Startup, setup)
             .add_systems(PostStartup, configure_gizmos)
             .add_observer(on_model_ready)
@@ -40,6 +41,10 @@ impl Plugin for ScenePlugin {
 #[derive(Default, Reflect, GizmoConfigGroup)]
 pub struct OverlayGizmos;
 
+/// Health bars: thick lines, always on top.
+#[derive(Default, Reflect, GizmoConfigGroup)]
+pub struct BarGizmos;
+
 /// The game currently shown, if any. Owned here so render systems can read it
 /// while the session logic (which holds non-Sync sockets) lives elsewhere.
 #[derive(Resource, Default)]
@@ -50,7 +55,8 @@ struct Assets3d {
     units: HashMap<UnitKind, Handle<WorldAsset>>,
     structs: HashMap<StructKind, Handle<WorldAsset>>,
     team: Vec<Handle<StandardMaterial>>,
-    crystal: Handle<Mesh>,
+    /// One ore crystal: positions, normals, indices (merged per chunk at runtime).
+    crystal: (Vec<Vec3>, Vec<Vec3>, Vec<u32>),
     crystal_mat: Handle<StandardMaterial>,
     batches: [Handle<Mesh>; 4],
 }
@@ -87,8 +93,8 @@ struct Part {
 struct Spawned {
     units: HashMap<u32, Entity>,
     structs: HashMap<u32, (Entity, u8)>,
-    /// Per tile: crystal entities and the ore level they show.
-    ore: HashMap<usize, (u16, Vec<Entity>)>,
+    /// Per 8x8-tile chunk: the ore level each tile shows, and the merged crystal mesh.
+    ore: HashMap<usize, (Vec<u16>, Entity, Handle<Mesh>)>,
     ore_timer: f32,
     terrain: Option<TerrainView>,
 }
@@ -138,6 +144,9 @@ fn setup(
     commands.spawn((
         MainCam,
         Camera3d::default(),
+        // FXAA is far cheaper than 4x MSAA on integrated GPUs and looks as good here.
+        Msaa::Off,
+        bevy::anti_alias::fxaa::Fxaa::default(),
         Camera { order: 0, ..default() },
         Projection::from(OrthographicProjection {
             scaling_mode: ScalingMode::Fixed { width: 26.5, height: 20.0 },
@@ -179,7 +188,19 @@ fn setup(
             })
         })
         .collect();
-    let crystal = meshes.add(Cone::new(0.06, 0.2).mesh().resolution(4));
+    let crystal = {
+        let m = Cone::new(0.06, 0.2).mesh().resolution(4).build();
+        let get = |a| match m.attribute(a) {
+            Some(bevy::mesh::VertexAttributeValues::Float32x3(v)) => v.iter().map(|p| Vec3::from_array(*p)).collect(),
+            _ => Vec::new(),
+        };
+        let ind = match m.indices() {
+            Some(Indices::U32(i)) => i.clone(),
+            Some(Indices::U16(i)) => i.iter().map(|x| *x as u32).collect(),
+            None => Vec::new(),
+        };
+        (get(Mesh::ATTRIBUTE_POSITION), get(Mesh::ATTRIBUTE_NORMAL), ind)
+    };
     let crystal_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 0.62, 0.2),
         emissive: LinearRgba::rgb(1.6, 0.55, 0.08),
@@ -224,6 +245,9 @@ fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
     let (c, _) = store.config_mut::<OverlayGizmos>();
     c.line.width = 2.0;
     c.depth_bias = -0.2;
+    let (c, _) = store.config_mut::<BarGizmos>();
+    c.line.width = 5.0;
+    c.depth_bias = -1.0;
     let (c, _) = store.config_mut::<DefaultGizmoConfigGroup>();
     c.line.width = 2.0;
 }
@@ -356,10 +380,11 @@ fn sync_units(
         } else {
             (g.upos(u), Game::uz(u), g.unit_visible(u))
         };
-        *tf = Transform::from_translation(world_pos(at, z))
-            .with_rotation(Quat::from_rotation_y(-ang))
-            .with_scale(Vec3::splat(UNIT_SCALE));
-        *vis = if show { Visibility::Inherited } else { Visibility::Hidden };
+        // Only touch what changed: a written Transform re-propagates the whole model.
+        tf.set_if_neq(
+            Transform::from_translation(world_pos(at, z)).with_rotation(Quat::from_rotation_y(-ang)).with_scale(Vec3::splat(UNIT_SCALE)),
+        );
+        vis.set_if_neq(if show { Visibility::Inherited } else { Visibility::Hidden });
     }
 }
 
@@ -411,7 +436,7 @@ fn animate_parts(
             PartKind::Rotor(phase) => {
                 let id = units.get(p.root).map_or(0, |u| u.0);
                 let a = g.time * 38.0 + phase + id as f32;
-                *tf = p.rest.with_rotation(p.rest.rotation * Quat::from_rotation_y(a));
+                tf.set_if_neq(p.rest.with_rotation(p.rest.rotation * Quat::from_rotation_y(a)));
             }
             PartKind::Turret => {
                 // Buildings aim at their target; vehicle turrets follow the hull.
@@ -420,29 +445,34 @@ fn animate_parts(
                 });
                 if let Some(aim) = aim.filter(|a| *a != (0, 0)) {
                     let a = (aim.1 as f32).atan2(aim.0 as f32);
-                    *tf = p.rest.with_rotation(Quat::from_rotation_y(-a) * p.rest.rotation);
+                    tf.set_if_neq(p.rest.with_rotation(Quat::from_rotation_y(-a) * p.rest.rotation));
                 }
             }
             PartKind::Load => {
                 let load = units.get(p.root).ok().and_then(|u| g.world.units.get(&u.0)).map_or(0, |u| u.load);
                 let k = load as f32 / cinderfront::sim::HARVEST_CAP as f32;
-                *tf = p.rest.with_scale(p.rest.scale * Vec3::new(1.0, k.clamp(0.0, 1.0).max(0.001), 1.0));
+                tf.set_if_neq(p.rest.with_scale(p.rest.scale * Vec3::new(1.0, k.clamp(0.0, 1.0).max(0.001), 1.0)));
             }
         }
     }
 }
 
+const ORE_CT: i32 = 8;
+
 /// Ore crystals: a few glowing spikes per ore tile, fewer as the tile is mined out.
+/// All crystals of an 8x8-tile chunk share one mesh (one draw, one entity), rebuilt
+/// only when a tile in it changes level. They do not cast shadows.
 fn sync_ore(
     view: Res<View>,
     time: Res<Time>,
     assets: Res<Assets3d>,
     mut spawned: ResMut<Spawned>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut commands: Commands,
 ) {
     let Some(g) = &view.0 else {
-        for (_, (_, es)) in spawned.ore.drain() {
-            es.into_iter().for_each(|e| commands.entity(e).despawn());
+        for (_, (_, e, _)) in spawned.ore.drain() {
+            commands.entity(e).despawn();
         }
         return;
     };
@@ -452,33 +482,61 @@ fn sync_ore(
     }
     spawned.ore_timer = 0.5;
     let w = &g.world;
-    for ty in 0..MAP_H {
-        for tx in 0..MAP_W {
-            let i = idx(tx, ty);
-            let level = if w.terrain[i] == Terrain::Ore && g.explored[i] { 1 + (w.ore[i] / 200).min(4) } else { 0 };
-            if spawned.ore.get(&i).map_or(0, |o| o.0) == level {
+    let level = |i: usize| if w.terrain[i] == Terrain::Ore && g.explored[i] { 1 + (w.ore[i] / 200).min(4) } else { 0 };
+    for cy in 0..MAP_H / ORE_CT {
+        for cx in 0..MAP_W / ORE_CT {
+            let tiles: Vec<(i32, i32)> =
+                (0..ORE_CT * ORE_CT).map(|k| (cx * ORE_CT + k % ORE_CT, cy * ORE_CT + k / ORE_CT)).collect();
+            let levels: Vec<u16> = tiles.iter().map(|(x, y)| level(idx(*x, *y))).collect();
+            let key = (cy * (MAP_W / ORE_CT) + cx) as usize;
+            if spawned.ore.get(&key).is_some_and(|o| o.0 == levels) || (!spawned.ore.contains_key(&key) && levels.iter().all(|l| *l == 0)) {
                 continue;
             }
-            if let Some((_, es)) = spawned.ore.remove(&i) {
-                es.into_iter().for_each(|e| commands.entity(e).despawn());
+            let (mut pos, mut nrm, mut ind) = (Vec::new(), Vec::new(), Vec::new());
+            for ((tx, ty), lv) in tiles.iter().zip(&levels) {
+                if *lv == 0 {
+                    continue;
+                }
+                let i = idx(*tx, *ty);
+                let amount = (w.ore[i] as f32 / 800.0).clamp(0.2, 1.0);
+                for j in 0..(*lv as i32 + 1) {
+                    let h = |a: i32, b: i32, s: u32| crate::gfx::hash2(a, b, s);
+                    let (hx, hy, hs) = (h(tx * 7 + j, *ty, 1), h(*tx, ty * 5 + j, 2), h(tx + j, ty - j, 3));
+                    let p = Vec3::new(*tx as f32 + 0.1 + 0.8 * hx, 0.0, *ty as f32 + 0.1 + 0.8 * hy);
+                    let sc = (0.7 + 0.8 * hs) * (0.6 + 0.4 * amount);
+                    let rot = Quat::from_rotation_y(hs * 3.0)
+                        * Quat::from_rotation_z((hx - 0.5) * 0.6)
+                        * Quat::from_rotation_x((hy - 0.5) * 0.6);
+                    let base = pos.len() as u32;
+                    let (cp, cn, ci) = &assets.crystal;
+                    pos.extend(cp.iter().map(|v| (p + Vec3::Y * 0.08 * sc + rot * (*v * sc)).to_array()));
+                    nrm.extend(cn.iter().map(|n| (rot * *n).to_array()));
+                    ind.extend(ci.iter().map(|k| k + base));
+                }
             }
-            if level == 0 {
+            if ind.is_empty() {
+                if let Some((_, e, _)) = spawned.ore.remove(&key) {
+                    commands.entity(e).despawn();
+                }
                 continue;
             }
-            let amount = (w.ore[i] as f32 / 800.0).clamp(0.2, 1.0);
-            let mut es = Vec::new();
-            for j in 0..(level as i32 + 1) {
-                let h = |a: i32, b: i32, s: u32| crate::gfx::hash2(a, b, s);
-                let (hx, hy, hs) = (h(tx * 7 + j, ty, 1), h(tx, ty * 5 + j, 2), h(tx + j, ty - j, 3));
-                let p = Vec3::new(tx as f32 + 0.1 + 0.8 * hx, 0.0, ty as f32 + 0.1 + 0.8 * hy);
-                let s = (0.7 + 0.8 * hs) * (0.6 + 0.4 * amount);
-                let tilt = Quat::from_rotation_z((hx - 0.5) * 0.6) * Quat::from_rotation_x((hy - 0.5) * 0.6);
-                let tf = Transform::from_translation(p + Vec3::Y * 0.08 * s)
-                    .with_rotation(Quat::from_rotation_y(hs * 3.0) * tilt)
-                    .with_scale(Vec3::splat(s));
-                es.push(commands.spawn((Mesh3d(assets.crystal.clone()), MeshMaterial3d(assets.crystal_mat.clone()), tf)).id());
+            let mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, nrm)
+                .with_inserted_indices(Indices::U32(ind));
+            match spawned.ore.get_mut(&key) {
+                Some(o) => {
+                    let _ = meshes.insert(&o.2, mesh);
+                    o.0 = levels;
+                }
+                None => {
+                    let h = meshes.add(mesh);
+                    let e = commands
+                        .spawn((Mesh3d(h.clone()), MeshMaterial3d(assets.crystal_mat.clone()), Transform::IDENTITY, bevy::light::NotShadowCaster))
+                        .id();
+                    spawned.ore.insert(key, (levels, e, h));
+                }
             }
-            spawned.ore.insert(i, (level, es));
         }
     }
 }
@@ -534,7 +592,7 @@ fn empty_batch() -> Mesh {
     Batch::default().into_mesh()
 }
 
-fn sync_fx(view: Res<View>, assets: Res<Assets3d>, mut meshes: ResMut<Assets<Mesh>>) {
+fn sync_fx(view: Res<View>, assets: Res<Assets3d>, mut meshes: ResMut<Assets<Mesh>>, mut was_empty: Local<[bool; 4]>) {
     let (mut add, mut shade, mut smoke, mut solid) = (Batch::default(), Batch::default(), Batch::default(), Batch::default());
     if let Some(g) = &view.0 {
         for (at, r, age) in &g.decals {
@@ -585,8 +643,13 @@ fn sync_fx(view: Res<View>, assets: Res<Assets3d>, mut meshes: ResMut<Assets<Mes
             }
         }
     }
-    for (h, b) in assets.batches.iter().zip([add, shade, smoke, solid]) {
-        let _ = meshes.insert(h, b.into_mesh());
+    // Re-upload a batch only if it has something in it now or had last frame.
+    for (i, (h, b)) in assets.batches.iter().zip([add, shade, smoke, solid]).enumerate() {
+        let empty = b.ind.is_empty();
+        if !(empty && was_empty[i]) {
+            let _ = meshes.insert(h, b.into_mesh());
+        }
+        was_empty[i] = empty;
     }
 }
 
@@ -594,10 +657,39 @@ fn ground_iso(p: Vec3) -> Isometry3d {
     Isometry3d::new(p, Quat::from_rotation_arc(Vec3::Z, Vec3::Y))
 }
 
-fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>) {
+fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>, mut bars: Gizmos<BarGizmos>) {
     let Some(g) = &view.0 else { return };
     let col = |c: Rgba| crate::gfx::to_color(c);
     let w = &g.world;
+    // Health bars: selected or damaged units, damaged buildings.
+    let mut bar = |at: Vec3, len: f32, frac: f32| {
+        let frac = frac.clamp(0.0, 1.0);
+        let c = if frac > 0.5 {
+            rgba(0.3, 0.95, 0.35, 1.0)
+        } else if frac > 0.25 {
+            rgba(1.0, 0.8, 0.15, 1.0)
+        } else {
+            rgba(1.0, 0.25, 0.15, 1.0)
+        };
+        let a = at - Vec3::X * len / 2.0;
+        bars.line(a - Vec3::X * 0.03, a + Vec3::X * (len + 0.03), Color::srgba(0.0, 0.0, 0.0, 0.85));
+        bars.line(a, a + Vec3::X * len * frac, col(c));
+    };
+    for u in w.units.values().filter(|u| !u.carried && g.unit_visible(u)) {
+        let frac = u.hp as f32 / u.kind.def().hp as f32;
+        let sel = g.sel.contains(&u.id);
+        if sel || frac < 1.0 {
+            bar(world_pos(g.upos(u), Game::uz(u) + 30.0), if sel { 0.65 } else { 0.55 }, frac);
+        }
+    }
+    for s in g.shown_structs() {
+        let d = s.kind.def();
+        let frac = s.hp as f32 / d.hp.max(1) as f32;
+        if frac < 1.0 && d.hp > 0 {
+            let top = Vec3::new(s.x as f32 + d.w as f32 / 2.0, struct_height(s.kind) + 0.45, s.y as f32 + d.h as f32 / 2.0);
+            bar(top, (d.w as f32 * 0.7).max(0.5), frac);
+        }
+    }
     // Selected units: ring on the ground.
     for u in g.sel.iter().filter_map(|id| w.units.get(id)) {
         let k = if matches!(u.kind, UnitKind::Trooper | UnitKind::Rocketeer) { 0.65 } else { 1.15 };

@@ -350,7 +350,12 @@ fn accept(
                 reflectance: 0.2,
                 ..default()
             });
-            let entity = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat), Transform::IDENTITY)).id();
+            let mut e = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat), Transform::IDENTITY));
+            // Flat ground cannot shadow anything; only chunks with cliffs go into the shadow map.
+            if b.heights.iter().all(|h| *h < 0.02) {
+                e.insert(bevy::light::NotShadowCaster);
+            }
+            let entity = e.id();
             tv.chunks[i] = Some(Chunk { entity, mesh, image });
         }
     }
