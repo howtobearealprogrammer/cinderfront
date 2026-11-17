@@ -337,9 +337,6 @@ fn sync_terrain(
     terrain::update(tv, g, time.delta_secs(), &mut commands, &mut meshes, &mut images, &mut materials);
 }
 
-fn world_pos(p: Vec2, z: f32) -> Vec3 {
-    Vec3::new(p.x / PX, z / PX, p.y / PX)
-}
 
 fn sync_units(
     view: Res<View>,
@@ -382,7 +379,7 @@ fn sync_units(
         };
         // Only touch what changed: a written Transform re-propagates the whole model.
         tf.set_if_neq(
-            Transform::from_translation(world_pos(at, z)).with_rotation(Quat::from_rotation_y(-ang)).with_scale(Vec3::splat(UNIT_SCALE)),
+            Transform::from_translation(g.wpos(at, z)).with_rotation(Quat::from_rotation_y(-ang)).with_scale(Vec3::splat(UNIT_SCALE)),
         );
         vis.set_if_neq(if show { Visibility::Inherited } else { Visibility::Hidden });
     }
@@ -415,7 +412,7 @@ fn sync_structs(
         }
         let Some(model) = assets.structs.get(&kind) else { continue };
         let d = kind.def();
-        let at = Vec3::new(x as f32 + d.w as f32 / 2.0, 0.0, y as f32 + d.h as f32 / 2.0);
+        let at = g.on_ground(Vec2::new(x as f32 + d.w as f32 / 2.0, y as f32 + d.h as f32 / 2.0), 0.0);
         let e = commands
             .spawn((StructView(id), Transform::from_translation(at), Visibility::Inherited))
             .with_child((WorldAssetRoot(model.clone()), Team(owner)))
@@ -502,7 +499,7 @@ fn sync_ore(
                 for j in 0..(*lv as i32 + 1) {
                     let h = |a: i32, b: i32, s: u32| crate::gfx::hash2(a, b, s);
                     let (hx, hy, hs) = (h(tx * 7 + j, *ty, 1), h(*tx, ty * 5 + j, 2), h(tx + j, ty - j, 3));
-                    let p = Vec3::new(*tx as f32 + 0.1 + 0.8 * hx, 0.0, *ty as f32 + 0.1 + 0.8 * hy);
+                    let p = g.on_ground(Vec2::new(*tx as f32 + 0.1 + 0.8 * hx, *ty as f32 + 0.1 + 0.8 * hy), 0.0);
                     let sc = (0.7 + 0.8 * hs) * (0.6 + 0.4 * amount);
                     let rot = Quat::from_rotation_y(hs * 3.0)
                         * Quat::from_rotation_z((hx - 0.5) * 0.6)
@@ -597,13 +594,13 @@ fn sync_fx(view: Res<View>, assets: Res<Assets3d>, mut meshes: ResMut<Assets<Mes
     if let Some(g) = &view.0 {
         for (at, r, age) in &g.decals {
             let a = 0.6 * (1.0 - age / 90.0);
-            shade.flat(world_pos(*at, 0.4), r * 1.5 / PX, r * 1.5 / PX, rgba(0.02, 0.02, 0.02, a));
+            shade.flat(g.wpos(*at, 0.4), r * 1.5 / PX, r * 1.5 / PX, rgba(0.02, 0.02, 0.02, a));
         }
         for p in &g.parts {
             let k = p.age / p.life;
             let c = p.c0 + (p.c1 - p.c0) * k;
             let size = (p.s0 + (p.s1 - p.s0) * k) / PX;
-            let at = world_pos(p.p, p.z);
+            let at = g.wpos(p.p, p.z);
             if p.smoke {
                 smoke.billboard(at, size, p.rot, c);
             } else {
@@ -616,13 +613,31 @@ fn sync_fx(view: Res<View>, assets: Res<Assets3d>, mut meshes: ResMut<Assets<Mes
         for f in &g.fx {
             if let Fx::Shell { a, az, b, bz, t, life } = f {
                 let k = (t / life).min(1.0);
-                let at = world_pos(a.lerp(*b, k), az + (bz - az) * k);
+                let at = g.wpos(a.lerp(*b, k), az + (bz - az) * k);
                 add.billboard(at, 9.0 / PX, 0.0, rgba(1.0, 0.6, 0.2, 0.8));
                 add.billboard(at, 2.5 / PX, 0.0, rgba(1.0, 0.97, 0.8, 1.0));
             }
         }
-        // Placement ghost: tinted tiles under the cursor.
+        // Placement: every tile the held building may go on gets a green cell,
+        // everything else in view is dimmed; then the footprint under the cursor.
         if let Some(kind) = g.placing.filter(|k| g.ready(*k) && g.mouse.x < g.view_w()) {
+            let tile_quad = |b: &mut Batch, tx: i32, ty: i32, inset: f32, up: f32, c: Rgba| {
+                let (x0, y0, x1, y1) = (tx as f32 + inset, ty as f32 + inset, (tx + 1) as f32 - inset, (ty + 1) as f32 - inset);
+                let at = |x: f32, y: f32| g.on_ground(Vec2::new(x, y), up);
+                b.quad([at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)], c);
+            };
+            let v = g.view_ground();
+            let (x0, y0) = ((v.min.x.floor() as i32 - 1).max(0), (v.min.y.floor() as i32 - 3).max(0));
+            let (x1, y1) = ((v.max.x.ceil() as i32 + 1).min(MAP_W - 1), (v.max.y.ceil() as i32 + 1).min(MAP_H - 1));
+            for ty in y0..=y1 {
+                for tx in x0..=x1 {
+                    if g.world.place_tile_ok(kind, tx, ty) && g.world.near_own(g.me, StructKind::Slab, tx, ty) {
+                        tile_quad(&mut solid, tx, ty, 0.04, 0.02, rgba(0.25, 1.0, 0.4, 0.13));
+                    } else {
+                        tile_quad(&mut solid, tx, ty, 0.0, 0.02, rgba(0.0, 0.0, 0.02, 0.38));
+                    }
+                }
+            }
             let d = kind.def();
             let (gx, gy) = g.ghost_origin(kind, g.mouse);
             let near = g.world.near_own(g.me, kind, gx, gy);
@@ -638,7 +653,7 @@ fn sync_fx(view: Res<View>, assets: Res<Assets3d>, mut meshes: ResMut<Assets<Mes
                     } else {
                         rgba(0.2, 1.0, 0.35, pulse)
                     };
-                    solid.flat(Vec3::new(tx as f32 + 0.5, 0.03, ty as f32 + 0.5), 0.46, 0.46, c);
+                    tile_quad(&mut solid, tx, ty, 0.04, 0.04, c);
                 }
             }
         }
@@ -679,32 +694,32 @@ fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>, mut bars: Gizmo
         let frac = u.hp as f32 / u.kind.def().hp as f32;
         let sel = g.sel.contains(&u.id);
         if sel || frac < 1.0 {
-            bar(world_pos(g.upos(u), Game::uz(u) + 30.0), if sel { 0.65 } else { 0.55 }, frac);
+            bar(g.wpos(g.upos(u), Game::uz(u) + 30.0), if sel { 0.65 } else { 0.55 }, frac);
         }
     }
     for s in g.shown_structs() {
         let d = s.kind.def();
         let frac = s.hp as f32 / d.hp.max(1) as f32;
         if frac < 1.0 && d.hp > 0 {
-            let top = Vec3::new(s.x as f32 + d.w as f32 / 2.0, struct_height(s.kind) + 0.45, s.y as f32 + d.h as f32 / 2.0);
+            let top = g.on_ground(Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0), struct_height(s.kind) + 0.45);
             bar(top, (d.w as f32 * 0.7).max(0.5), frac);
         }
     }
     // Selected units: ring on the ground.
     for u in g.sel.iter().filter_map(|id| w.units.get(id)) {
         let k = if matches!(u.kind, UnitKind::Trooper | UnitKind::Rocketeer) { 0.65 } else { 1.15 };
-        let at = world_pos(g.upos(u), Game::uz(u) + 1.0);
+        let at = g.wpos(g.upos(u), Game::uz(u) + 1.0);
         gz.ellipse(ground_iso(at), Vec2::new(0.38, 0.3) * k, col(rgba(0.75, 1.0, 0.8, 0.95)));
     }
     // Selected structures: footprint outline, rally flag.
     for s in g.sel_structs.iter().filter_map(|id| w.structs.get(id)) {
         let d = s.kind.def();
         let c = rgba(0.75, 1.0, 0.8, 0.95);
-        let mid = Vec3::new(s.x as f32 + d.w as f32 / 2.0, 0.05, s.y as f32 + d.h as f32 / 2.0);
+        let mid = g.on_ground(Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0), 0.05);
         gz.rect(ground_iso(mid), Vec2::new(d.w as f32 + 0.1, d.h as f32 + 0.1), col(c));
         if let (Some(r), true) = (s.rally, TRAIN_AT.contains(&s.kind)) {
-            let foot = Vec3::new(r.0 as f32 + 0.5, 0.02, r.1 as f32 + 0.5);
-            let from = Vec3::new(mid.x, 0.05, s.y as f32 + d.h as f32);
+            let foot = g.on_ground(Vec2::new(r.0 as f32 + 0.5, r.1 as f32 + 0.5), 0.02);
+            let from = Vec3::new(mid.x, mid.y, s.y as f32 + d.h as f32);
             let n = (from.distance(foot) / 0.3).max(1.0) as i32;
             for i in (0..n).step_by(2) {
                 gz.line(from.lerp(foot, i as f32 / n as f32), from.lerp(foot, (i + 1) as f32 / n as f32), col(fade(c, 0.7)));
@@ -723,7 +738,7 @@ fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>, mut bars: Gizmo
         if let Some(s) = g.own_struct_at(g.mouse_tile(g.mouse)).and_then(|id| w.structs.get(&id)) {
             let d = s.kind.def();
             let c = if g.mode == Mode::Repair { rgba(0.35, 1.0, 0.45, 1.0) } else { rgba(1.0, 0.82, 0.3, 1.0) };
-            let mid = Vec3::new(s.x as f32 + d.w as f32 / 2.0, 0.05, s.y as f32 + d.h as f32 / 2.0);
+            let mid = g.on_ground(Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0), 0.05);
             let size = Vec2::new(d.w as f32, d.h as f32);
             gz.rect(ground_iso(mid), size, col(c));
             gz.rect(ground_iso(mid + Vec3::Y * struct_height(s.kind)), size, col(fade(c, 0.6)));
@@ -731,7 +746,7 @@ fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>, mut bars: Gizmo
     }
     for s in g.shown_structs().filter(|s| s.repairing) {
         let d = s.kind.def();
-        let top = Vec3::new(s.x as f32 + d.w as f32 / 2.0, struct_height(s.kind) + 0.3, s.y as f32 + d.h as f32 / 2.0);
+        let top = g.on_ground(Vec2::new(s.x as f32 + d.w as f32 / 2.0, s.y as f32 + d.h as f32 / 2.0), struct_height(s.kind) + 0.3);
         let k = 0.55 + 0.45 * (g.time * 7.0).sin();
         let green = col(rgba(0.35, 1.0, 0.45, k));
         gz.line(top - Vec3::X * 0.22, top + Vec3::X * 0.22, green);
@@ -742,14 +757,14 @@ fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>, mut bars: Gizmo
         match f {
             Fx::Tracer { a, az, b, bz, t } => {
                 let k = t / 0.1;
-                let (pa, pb) = (world_pos(*a, *az), world_pos(*b, *bz));
+                let (pa, pb) = (g.wpos(*a, *az), g.wpos(*b, *bz));
                 let (p, q) = (pa.lerp(pb, (k * 1.3 - 0.3).clamp(0.0, 1.0)), pa.lerp(pb, (k * 1.3).min(1.0)));
                 gz.line(p, q, col(rgba(1.0, 0.97, 0.75, 0.95)));
             }
             Fx::Ring { at, z, t, life, r } => {
                 let k = t / life;
                 let rr = r * (0.25 + 0.75 * k) / PX;
-                gz.ellipse(ground_iso(world_pos(*at, *z + 1.0)), Vec2::splat(rr), col(rgba(1.0, 0.9, 0.7, 0.8 * (1.0 - k))));
+                gz.ellipse(ground_iso(g.wpos(*at, *z + 1.0)), Vec2::splat(rr), col(rgba(1.0, 0.9, 0.7, 0.8 * (1.0 - k))));
             }
             Fx::Shell { .. } => {}
         }

@@ -24,6 +24,10 @@ pub enum Terrain {
     Rock,
     Ore,
     Cliff,
+    /// Steep edge of a plateau: blocks ground units and building.
+    Bank,
+    /// Slope between two levels: walkable, only walls can be built on it.
+    Ramp,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -343,6 +347,9 @@ pub enum Event {
 pub struct World {
     pub tick: u32,
     pub terrain: Vec<Terrain>,
+    /// Height level per tile (0 low .. 2 high). Banks carry their plateau's level,
+    /// ramps the lower level they lead to. Fixed at map generation.
+    pub level: Vec<u8>,
     pub ore: Vec<u16>,
     pub slab: Vec<bool>,
     pub structure_at: Vec<u32>,
@@ -393,23 +400,84 @@ fn noise(seed: u32, x: i32, y: i32, cell: i32) -> i32 {
 }
 
 /// One quadrant is generated from noise and mirrored four ways, so every start is equal.
-fn gen_map(seed: u32) -> (Vec<Terrain>, Vec<u16>) {
+///
+/// Height: each start sits on a middle-level plateau with two ramps (east and south
+/// in quadrant terms, toward the ore fields); the map centre is a high plateau with
+/// one ramp facing each base. Every level change is a ring of `Bank` tiles except
+/// at ramps, so pathfinding needs no height rule of its own.
+fn gen_map(seed: u32) -> (Vec<Terrain>, Vec<u16>, Vec<u8>) {
     let q = |v: i32| if v < MAP_W / 2 { v } else { MAP_W - 1 - v };
+    let n = (MAP_W * MAP_H) as usize;
+    // Levels first: they only depend on the seed.
+    let mut level = vec![0u8; n];
+    for y in 0..MAP_H {
+        for x in 0..MAP_W {
+            let (qx, qy) = (q(x), q(y));
+            let (cx, cy) = (2 * qx - (MAP_W - 1), 2 * qy - (MAP_H - 1));
+            let home_r = 9 + noise(seed + 21, qx, qy, 4) * 3 / 256;
+            let mid_r = 7 + noise(seed + 22, qx, qy, 4) * 3 / 256;
+            // The home plateau runs out to the map edges; only its inner sides drop.
+            level[idx(x, y)] = if qx <= 12 + home_r && qy <= 12 + home_r {
+                1
+            } else if cx * cx + cy * cy <= 4 * mid_r * mid_r {
+                2
+            } else {
+                0
+            };
+        }
+    }
+    let lower_neighbour = |x: i32, y: i32| -> Option<u8> {
+        let l = level[idx(x, y)];
+        let mut low: Option<u8> = None;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if inb(x + dx, y + dy) && level[idx(x + dx, y + dy)] < l {
+                    let m = level[idx(x + dx, y + dy)];
+                    low = Some(low.map_or(m, |v: u8| v.min(m)));
+                }
+            }
+        }
+        low
+    };
+    // Low ground within 2 tiles of a plateau stays clear of outcrops, so ramps and
+    // the walk around plateaus can never be blocked.
+    let near_high = |x: i32, y: i32| {
+        (-2..=2).any(|dy| (-2..=2).any(|dx| inb(x + dx, y + dy) && level[idx(x + dx, y + dy)] > 0))
+    };
     let mut cliff_t = 200;
     loop {
-        let mut terrain = vec![Terrain::Dust; (MAP_W * MAP_H) as usize];
-        let mut ore = vec![0u16; (MAP_W * MAP_H) as usize];
+        let mut terrain = vec![Terrain::Dust; n];
+        let mut ore = vec![0u16; n];
+        let mut lv = level.clone();
         for y in 0..MAP_H {
             for x in 0..MAP_W {
                 let (qx, qy) = (q(x), q(y));
+                let i = idx(x, y);
                 let ds = (qx - 12).abs().max((qy - 12).abs());
                 let near = |cx: i32, cy: i32, r2: i32| (qx - cx) * (qx - cx) + (qy - cy) * (qy - cy) <= r2;
                 let rock = noise(seed, qx, qy, 8) * 3 / 4 + noise(seed + 1, qx, qy, 3) / 4 > 138;
-                let mut t = if ds <= 7 {
+                let t = if let Some(low) = lower_neighbour(x, y) {
+                    let ramp = match level[i] {
+                        1 => ((qy - 12).abs() <= 1 && qx > 12) || ((qx - 12).abs() <= 1 && qy > 12),
+                        _ => (qx - qy).abs() <= 1,
+                    };
+                    if ramp {
+                        lv[i] = low;
+                        Terrain::Ramp
+                    } else {
+                        Terrain::Bank
+                    }
+                } else if level[i] == 1 {
+                    if ds <= 7 || rock {
+                        Terrain::Rock
+                    } else {
+                        Terrain::Dust
+                    }
+                } else if level[i] == 2 {
                     Terrain::Rock
-                } else if near(24, 13, 14) || near(13, 24, 14) || near(47, 47, 40) {
+                } else if near(26, 13, 14) || near(13, 26, 14) || near(35, 35, 10) {
                     Terrain::Ore
-                } else if ds > 10 && noise(seed + 13, qx, qy, 5) > cliff_t {
+                } else if !near_high(x, y) && ds > 13 && noise(seed + 13, qx, qy, 5) > cliff_t {
                     Terrain::Cliff
                 } else if rock {
                     Terrain::Rock
@@ -418,32 +486,28 @@ fn gen_map(seed: u32) -> (Vec<Terrain>, Vec<u16>) {
                 } else {
                     Terrain::Dust
                 };
-                if x == 0 || y == 0 || x == MAP_W - 1 || y == MAP_H - 1 {
-                    if t == Terrain::Cliff {
-                        t = Terrain::Dust;
-                    }
-                }
-                terrain[idx(x, y)] = t;
-                if t == Terrain::Ore {
-                    ore[idx(x, y)] = 400 + (h2(seed + 99, qx, qy) % 600) as u16;
+                let edge = x == 0 || y == 0 || x == MAP_W - 1 || y == MAP_H - 1;
+                terrain[i] = if edge && t == Terrain::Cliff { Terrain::Dust } else { t };
+                if terrain[i] == Terrain::Ore {
+                    ore[i] = 400 + (h2(seed + 99, qx, qy) % 600) as u16;
                 }
             }
         }
         // Start must reach map centre; by symmetry that connects all starts.
-        let mut seen = vec![false; terrain.len()];
+        let mut seen = vec![false; n];
         let mut stack = vec![(12, 12)];
         seen[idx(12, 12)] = true;
         while let Some((x, y)) = stack.pop() {
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let (nx, ny) = (x + dx, y + dy);
-                if inb(nx, ny) && !seen[idx(nx, ny)] && terrain[idx(nx, ny)] != Terrain::Cliff {
+                if inb(nx, ny) && !seen[idx(nx, ny)] && !matches!(terrain[idx(nx, ny)], Terrain::Cliff | Terrain::Bank) {
                     seen[idx(nx, ny)] = true;
                     stack.push((nx, ny));
                 }
             }
         }
-        if seen[idx(47, 47)] || cliff_t > 255 {
-            return (terrain, ore);
+        if seen[idx(MAP_W / 2, MAP_H / 2)] || cliff_t > 255 {
+            return (terrain, ore, lv);
         }
         cliff_t += 10;
     }
@@ -451,12 +515,13 @@ fn gen_map(seed: u32) -> (Vec<Terrain>, Vec<u16>) {
 
 impl World {
     pub fn new(seed: u32, num_players: u8) -> World {
-        let (terrain, ore) = gen_map(seed);
+        let (terrain, ore, level) = gen_map(seed);
         let n = terrain.len();
         let (a, b) = (12, MAP_W - 13);
         let mut w = World {
             tick: 0,
             terrain,
+            level,
             ore,
             slab: vec![false; n],
             structure_at: vec![0; n],
@@ -495,7 +560,26 @@ impl World {
     // ---------- queries ----------
 
     pub fn walkable(&self, x: i32, y: i32) -> bool {
-        inb(x, y) && self.terrain[idx(x, y)] != Terrain::Cliff && self.structure_at[idx(x, y)] == 0
+        inb(x, y) && !matches!(self.terrain[idx(x, y)], Terrain::Cliff | Terrain::Bank) && self.structure_at[idx(x, y)] == 0
+    }
+
+    /// Height level of the tile under `p`.
+    pub fn level_at(&self, p: Pos) -> i32 {
+        let (x, y) = (p.0.div_euclid(TILE), p.1.div_euclid(TILE));
+        if inb(x, y) {
+            self.level[idx(x, y)] as i32
+        } else {
+            0
+        }
+    }
+
+    /// Extra range in tiles for shooting down from higher ground (none involving aircraft).
+    pub fn height_bonus(&self, from: Pos, from_air: bool, to: Pos, to_air: bool) -> i32 {
+        if from_air || to_air {
+            0
+        } else {
+            (self.level_at(from) - self.level_at(to)).max(0)
+        }
     }
 
     pub fn has_struct(&self, p: u8, kind: StructKind) -> bool {
@@ -522,7 +606,7 @@ impl World {
             return false;
         }
         let i = idx(x, y);
-        self.terrain[i] == Terrain::Rock
+        (self.terrain[i] == Terrain::Rock || (self.terrain[i] == Terrain::Ramp && kind == StructKind::Wall))
             && self.structure_at[i] == 0
             && self.occ[i] == 0
             && !(kind.is_slab() && self.slab[i])
@@ -577,15 +661,15 @@ impl World {
         }
     }
 
-    fn acquire(&self, owner: u8, from: Pos, range: i32, hits_air: bool) -> Option<Target> {
-        let r2 = range2(range);
+    fn acquire(&self, owner: u8, from: Pos, from_air: bool, range: i32, hits_air: bool) -> Option<Target> {
         let mut best: Option<(i64, Target)> = None;
         for u in self.units.values() {
-            if u.owner == owner || u.hp <= 0 || u.carried || (u.kind.def().air && !hits_air) {
+            let air = u.kind.def().air;
+            if u.owner == owner || u.hp <= 0 || u.carried || (air && !hits_air) {
                 continue;
             }
             let d = d2(from, u.pos);
-            if d <= r2 && best.map_or(true, |b| d < b.0) {
+            if d <= range2(range + self.height_bonus(from, from_air, u.pos, air)) && best.map_or(true, |b| d < b.0) {
                 best = Some((d, Target::Unit(u.id)));
             }
         }
@@ -596,7 +680,7 @@ impl World {
                 }
                 let (near, ..) = self.target_info(from, Target::Struct(s.id))?;
                 let d = d2(from, near);
-                if d <= r2 && best.map_or(true, |b| d < b.0) {
+                if d <= range2(range + self.height_bonus(from, from_air, near, false)) && best.map_or(true, |b| d < b.0) {
                     best = Some((d, Target::Struct(s.id)));
                 }
             }
@@ -1350,7 +1434,7 @@ impl World {
             if pl.power_used > pl.power_made {
                 continue;
             }
-            if let Some(t) = self.acquire(owner, pos, range, true) {
+            if let Some(t) = self.acquire(owner, pos, false, range, true) {
                 if let Some(to) = self.hit(pos, false, t, dmg, 100, true) {
                     let s = self.structs.get_mut(&id).unwrap();
                     s.aim = (to.0 - pos.0, to.1 - pos.1);
@@ -1392,7 +1476,7 @@ impl World {
         if d.damage == 0 || u.cooldown > 0 {
             return false;
         }
-        match self.acquire(u.owner, u.pos, d.range, d.hits_air) {
+        match self.acquire(u.owner, u.pos, d.air, d.range, d.hits_air) {
             Some(t) => {
                 self.fire(u, t);
                 true
@@ -1421,7 +1505,7 @@ impl World {
         if owner == u.owner || d.damage == 0 || (air && !d.hits_air) {
             return None;
         }
-        let in_range = d2(u.pos, near) <= range2(d.range);
+        let in_range = d2(u.pos, near) <= range2(d.range + self.height_bonus(u.pos, d.air, near, air));
         if in_range && u.cooldown == 0 {
             self.fire(u, t);
         }

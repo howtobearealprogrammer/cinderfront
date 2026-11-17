@@ -7,7 +7,7 @@
 
 use crate::gfx::{fade, rgba, Rgba, Rng};
 use bevy::input::keyboard::KeyCode;
-use bevy::math::{Rect, Vec2};
+use bevy::math::{Rect, Vec2, Vec3};
 use cinderfront::sim::{
     center, idx, inb, Command, Step, Event, StructKind, Structure, Target, Terrain, Unit, UnitKind, World, MAP_H, MAP_W, TILE,
     TRAIN_AT,
@@ -171,6 +171,8 @@ pub struct Game {
     /// Fog of war, per tile. Purely a view filter: the sim knows nothing about it.
     pub visible: Vec<bool>,
     pub explored: Vec<bool>,
+    /// Terrain height at tile corners (see `corner_heights`). Fixed for a map.
+    pub corners: Vec<f32>,
     /// Bumped whenever `visible`/`explored` change.
     pub fog_gen: u32,
     /// Enemy structures as last seen.
@@ -183,6 +185,47 @@ pub struct Game {
     /// The in-game (Esc) menu, while open.
     pub pause: Option<PauseMenu>,
     rng: Rng,
+}
+
+/// World height of one terrain level, in tiles.
+pub const LEVEL_H: f32 = 0.8;
+
+/// Ground height (tiles) at every tile corner, `(MAP_W + 1) * (MAP_H + 1)` values.
+/// A corner takes the highest level of the plain tiles around it, so plateaus and
+/// low ground are flat and each bank or ramp tile is the slope between them.
+pub fn corner_heights(w: &World) -> Vec<f32> {
+    let mut out = Vec::with_capacity(((MAP_W + 1) * (MAP_H + 1)) as usize);
+    for cy in 0..=MAP_H {
+        for cx in 0..=MAP_W {
+            let tiles = [(cx - 1, cy - 1), (cx, cy - 1), (cx - 1, cy), (cx, cy)];
+            let (mut top, mut sum, mut n) = (None::<u8>, 0.0f32, 0.0f32);
+            for (x, y) in tiles.into_iter().filter(|(x, y)| inb(*x, *y)) {
+                let i = idx(x, y);
+                let l = w.level[i];
+                match w.terrain[i] {
+                    Terrain::Bank => sum += l as f32 - 0.5,
+                    Terrain::Ramp => sum += l as f32 + 0.5,
+                    _ => top = Some(top.map_or(l, |t| t.max(l))),
+                }
+                n += 1.0;
+            }
+            out.push(top.map_or(sum / n.max(1.0), |t| t as f32) * LEVEL_H);
+        }
+    }
+    out
+}
+
+/// Ground height in tiles at tile coordinates (`u`, `v`), bilinear over the corners.
+pub fn ground_h(corners: &[f32], u: f32, v: f32) -> f32 {
+    let u = u.clamp(0.0, MAP_W as f32 - 0.001);
+    let v = v.clamp(0.0, MAP_H as f32 - 0.001);
+    let (x0, y0) = (u.floor(), v.floor());
+    let (fx, fy) = (u - x0, v - y0);
+    let at = |x: i32, y: i32| corners[(y * (MAP_W + 1) + x) as usize];
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+    let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+    top * (1.0 - fy) + bot * fy
 }
 
 pub fn fpos(p: (i32, i32)) -> Vec2 {
@@ -221,6 +264,7 @@ impl Game {
             angles: HashMap::new(),
             visible: vec![false; tiles],
             explored: vec![false; tiles],
+            corners: Vec::new(),
             fog_gen: 0,
             ghosts: HashMap::new(),
             show_tech: false,
@@ -229,6 +273,7 @@ impl Game {
             pause: None,
             rng: Rng::new(0x1234_5678 ^ me as u32),
         };
+        g.corners = corner_heights(&g.world);
         g.center_on(g.world.starts[me as usize]);
         g.update_vis();
         g
@@ -261,16 +306,20 @@ impl Game {
     /// Recompute what this player can see right now. Runs after every sim tick.
     fn update_vis(&mut self) {
         let me = self.me;
-        let all = self.world.players[me as usize].defeated || self.world.winner.is_some();
+        // CF_REVEAL=1 (debug): no fog of war.
+        let reveal = std::env::var_os("CF_REVEAL").is_some();
+        let all = reveal || self.world.players[me as usize].defeated || self.world.winner.is_some();
         let before = self.visible.clone();
         self.visible.iter_mut().for_each(|v| *v = all);
         let mut eyes: Vec<((i32, i32), i32)> = Vec::new();
         for u in self.world.units.values().filter(|u| u.owner == me) {
-            eyes.push((u.tile, u.kind.sight()));
+            let up = if u.kind.def().air { 0 } else { self.world.level_at(u.pos) };
+            eyes.push((u.tile, u.kind.sight() + up));
         }
         for s in self.world.structs.values().filter(|s| s.owner == me) {
             let d = s.kind.def();
-            eyes.push(((s.x + d.w / 2, s.y + d.h / 2), s.kind.sight()));
+            let mid = (s.x + d.w / 2, s.y + d.h / 2);
+            eyes.push((mid, s.kind.sight() + self.world.level[idx(mid.0, mid.1)] as i32));
         }
         for ((cx, cy), r) in eyes {
             for dy in -r..=r {
@@ -514,18 +563,38 @@ impl Game {
         PX * self.zoom
     }
     /// Ground pixels + height to screen position (matches the 3D camera exactly).
+    /// `z` is the height above the terrain at `s`.
     pub fn proj(&self, s: Vec2, z: f32) -> Vec2 {
         let k = self.k();
         let rel = s / PX - self.focus;
-        Vec2::new(self.view_w() / 2.0 + rel.x * k, self.screen.y / 2.0 + (rel.y * PITCH_S - z / PX * PITCH_C) * k)
+        let h = z / PX + self.ground(s / PX);
+        Vec2::new(self.view_w() / 2.0 + rel.x * k, self.screen.y / 2.0 + (rel.y * PITCH_S - h * PITCH_C) * k)
     }
-    /// Screen position to the ground point under it, in tiles.
+    /// Screen position to the ground point under it, in tiles (follows terrain height).
     pub fn ground_at(&self, m: Vec2) -> Vec2 {
         let k = self.k();
-        Vec2::new(
-            self.focus.x + (m.x - self.view_w() / 2.0) / k,
-            self.focus.y + (m.y - self.screen.y / 2.0) / (k * PITCH_S),
-        )
+        let x = self.focus.x + (m.x - self.view_w() / 2.0) / k;
+        let flat = |h: f32| Vec2::new(x, self.focus.y + ((m.y - self.screen.y / 2.0) / k + h * PITCH_C) / PITCH_S);
+        let mut p = flat(0.0);
+        for _ in 0..4 {
+            p = flat(self.ground(p));
+        }
+        p
+    }
+    /// Terrain height in tiles at a point given in tiles.
+    pub fn ground(&self, t: Vec2) -> f32 {
+        if self.corners.is_empty() {
+            return 0.0;
+        }
+        ground_h(&self.corners, t.x, t.y)
+    }
+    /// World position (tiles) of a point in ground pixels, `z` ground pixels above the terrain.
+    pub fn wpos(&self, p: Vec2, z: f32) -> Vec3 {
+        Vec3::new(p.x / PX, z / PX + self.ground(p / PX), p.y / PX)
+    }
+    /// World position of a tile-space point lying on the terrain, lifted by `up` tiles.
+    pub fn on_ground(&self, t: Vec2, up: f32) -> Vec3 {
+        Vec3::new(t.x, self.ground(t) + up, t.y)
     }
     pub fn upos(&self, u: &Unit) -> Vec2 {
         fpos(u.prev).lerp(fpos(u.pos), self.alpha.clamp(0.0, 1.0))

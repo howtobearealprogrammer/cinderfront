@@ -23,6 +23,7 @@ Debug environment variables (all read in `src/main.rs`):
 - `CF_SHOT=out.png` — take a screenshot after `CF_SHOT_AT` seconds (default 8) and quit; forces windowed. This is the way to check visuals without a human.
 - `CF_RES=WxH` — window size (forces windowed). `CF_ZOOM` — starting zoom, demo only.
 - `CF_PERF=1` — log average / worst frame time to stderr every 2 s.
+- `CF_REVEAL=1` — no fog of war (pair with `CF_SHOT` and `CF_ZOOM` to see the whole map).
 - `CF_AUTOPLAY=1` — scripted orders, to exercise netcode without a human.
 - `CF_CURSORS=out.png` — write the cursor sprite sheet and exit, without opening a window.
 
@@ -34,7 +35,7 @@ Models and icons are generated, not hand-edited. Regenerate with Blender (about 
 
 `tools/blender/README.md` holds the model conventions (axes, origins, required node names `body` / `turret` / `rotor` / `load`, the `Team` material that takes the player colour) and how to add a model.
 
-`dist/cinderfront-linux-x86_64` is a committed single-file release binary; past commits that change `src/` refresh it. It is not byte-identical to `target/release/cinderfront` (smaller, presumably stripped) — the exact recipe is not recorded in the repo.
+`dist/cinderfront-linux-x86_64` is a committed single-file release binary; commits that change `src/` refresh it with `cargo build --release && strip -o dist/cinderfront-linux-x86_64 target/release/cinderfront`.
 
 ## Architecture
 
@@ -60,6 +61,10 @@ Data flows one way: input → `Game` → `Command` → sim → `Game` → render
 - `game.rs` — `Game` owns the `World` plus all client-only state: camera, selection, control groups, fog of war, ghosts of last-seen enemy structures, particles. It never mutates the sim; `Game::frame` returns the `Command`s the player issued. Fog is purely a view filter — the sim knows nothing about it. `Game::context()` decides both the cursor shape and what a right click does, so the two cannot disagree. HUD layout constants and HUD click handling also live here.
 - `main.rs` — `run_session` (system set `RunGame`) is the menu / lobby / match state machine and runs before anything draws. The live `Game` sits in the `View(Option<Game>)` resource.
 - `scene.rs`, `terrain.rs`, `hud.rs`, `cursor.rs` — read `View` each frame and mirror it into Bevy entities. Nothing here feeds back into the sim. These write components only when values change (Bevy re-lays-out UI and re-propagates transforms otherwise); keep that pattern when adding HUD or scene sync code.
+
+### Terrain height
+
+`World::level` holds a height level (0–2) per tile, fixed by `gen_map`. Levels only change across `Bank` tiles (impassable, unbuildable) or `Ramp` tiles (walkable; only walls build there), so pathfinding has no height rule of its own; the `levels_only_change_at_ramps` test guards that invariant. `World::height_bonus` gives +1 tile of weapon range per level the shooter stands above its target (no bonus involving aircraft); sight gets +1 per level in `Game::update_vis`. On the client, `corner_heights` / `ground_h` (`game.rs`) turn levels into a height field used by the terrain mesh, by `Game::wpos` / `on_ground` for placing models and effects, and by `proj` / `ground_at` so picking matches what is drawn. Anything new drawn in the world should go through those, not a hard-coded y.
 
 ### Units of measure
 

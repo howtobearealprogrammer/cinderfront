@@ -649,8 +649,11 @@ fn draw_minimap(g: &Game, img: &mut Image) {
                 Terrain::Rock if g.world.slab[i] => rgba(0.62, 0.62, 0.65, 1.0),
                 Terrain::Rock => rgba(0.33 * k, 0.32 * k, 0.34 * k, 1.0),
                 Terrain::Ore => rgba(1.0, 0.58, 0.12, 1.0),
-                Terrain::Cliff => rgba(0.13, 0.10, 0.10, 1.0),
+                Terrain::Cliff | Terrain::Bank => rgba(0.13, 0.10, 0.10, 1.0),
+                Terrain::Ramp => rgba(0.45 * k, 0.36 * k, 0.27 * k, 1.0),
             };
+            // Higher ground reads lighter.
+            let c = shade(c, 1.0 + 0.18 * g.world.level[i] as f32);
             let c = if !g.explored[i] {
                 rgba(0.02, 0.02, 0.03, 1.0)
             } else if !g.visible[i] {

@@ -71,10 +71,48 @@ fn map_is_symmetric_and_connected() {
                 Terrain::Rock => '#',
                 Terrain::Ore => 'o',
                 Terrain::Cliff => '^',
+                Terrain::Bank => '=',
+                Terrain::Ramp => '/',
             })
             .collect();
         println!("{row}");
     }
+}
+
+#[test]
+fn levels_only_change_at_ramps() {
+    let w = World::new(7, 4);
+    let walk = |x: i32, y: i32| inb(x, y) && !matches!(w.terrain[idx(x, y)], Terrain::Cliff | Terrain::Bank);
+    let mut ramps = 0;
+    for y in 0..MAP_H {
+        for x in 0..MAP_W {
+            ramps += (w.terrain[idx(x, y)] == Terrain::Ramp) as i32;
+            for (dx, dy) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+                let (a, b) = (idx(x, y), (x + dx, y + dy));
+                if walk(x, y) && walk(b.0, b.1) {
+                    let one_ramp = w.terrain[a] == Terrain::Ramp || w.terrain[idx(b.0, b.1)] == Terrain::Ramp;
+                    let diff = (w.level[a] as i32 - w.level[idx(b.0, b.1)] as i32).abs();
+                    assert!(diff == 0 || one_ramp, "level step without a ramp at {x},{y}");
+                }
+            }
+        }
+    }
+    assert!(ramps >= 12, "expected home and centre ramps, found {ramps} ramp tiles");
+    // Bases sit on raised ground, the centre higher still.
+    let s = w.starts[0];
+    assert_eq!(w.level[idx(s.0, s.1)], 1);
+    assert_eq!(w.level[idx(MAP_W / 2, MAP_H / 2)], 2);
+}
+
+#[test]
+fn high_ground_outranges() {
+    let w = World::new(7, 2);
+    let (hi, lo) = (center(w.starts[0]), center((w.starts[0].0 + 15, w.starts[0].1 + 15)));
+    assert_eq!(w.level_at(hi), 1);
+    assert_eq!(w.level_at(lo), 0);
+    assert_eq!(w.height_bonus(hi, false, lo, false), 1);
+    assert_eq!(w.height_bonus(lo, false, hi, false), 0, "no bonus shooting uphill");
+    assert_eq!(w.height_bonus(hi, false, lo, true), 0, "no bonus against aircraft");
 }
 
 #[test]
@@ -261,8 +299,8 @@ fn harvester_returns_to_its_assigned_patch() {
     build(&mut w, 0, StructKind::Power);
     build(&mut w, 0, StructKind::Refinery);
     let harv = w.units.values().find(|u| u.kind == UnitKind::Harvester).unwrap().id;
-    // Send it to the big field in the middle of the map, far past the patches by the base.
-    let home = (47, 47);
+    // Send it to the field between base and centre, far past the patches by the base.
+    let home = (35, 35);
     w.apply(0, &Command::Harvest { units: vec![harv], x: home.0, y: home.1 });
     let near_home = |w: &World| {
         let t = w.units[&harv].tile;

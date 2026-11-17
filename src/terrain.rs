@@ -5,7 +5,7 @@
 //! into the mesh vertex colours. Chunks re-bake on worker threads when their
 //! tiles change (ore mined, slabs laid).
 
-use crate::game::Game;
+use crate::game::{ground_h, Game, LEVEL_H};
 use crate::gfx::{fbm, hash2, rgba_image};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -35,6 +35,8 @@ struct Snap {
     terrain: Vec<Terrain>,
     ore: Vec<u16>,
     slab: Vec<bool>,
+    /// Ground height at tile corners (`Game::corners`).
+    corners: Arc<Vec<f32>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -43,6 +45,8 @@ struct S {
     rm: f32,
     cm: f32,
     om: f32,
+    /// Bank (plateau edge) weight: coloured like cliff rock, shaped by the level corners.
+    bm: f32,
     lo: f32,
     hi: f32,
     crack: f32,
@@ -80,7 +84,18 @@ fn sample(w: &Snap, u: f32, v: f32) -> S {
             Terrain::Rock => r += wt,
             Terrain::Cliff => c += wt,
             Terrain::Ore => o += wt * ore_level(w, i),
-            Terrain::Dust => {}
+            Terrain::Dust | Terrain::Ramp | Terrain::Bank => {}
+        }
+    }
+    // Banks follow the real slope geometry, so look them up without the warp.
+    let (bu, bv) = (u - 0.5, v - 0.5);
+    let (bi, bj) = (bu.floor(), bv.floor());
+    let (sx, sy) = (bu - bi, bv - bj);
+    let mut b = 0.0;
+    for (dx, dy, wt) in [(0, 0, (1.0 - sx) * (1.0 - sy)), (1, 0, sx * (1.0 - sy)), (0, 1, (1.0 - sx) * sy), (1, 1, sx * sy)] {
+        let i = idx((bi as i32 + dx).clamp(0, MAP_W - 1), (bj as i32 + dy).clamp(0, MAP_H - 1));
+        if w.terrain[i] == Terrain::Bank {
+            b += wt;
         }
     }
     let lo = fbm(u * 0.35, v * 0.35, 5, 3);
@@ -88,12 +103,13 @@ fn sample(w: &Snap, u: f32, v: f32) -> S {
     let cm = ss(0.40, 0.60, c + (hi - 0.5) * 0.25);
     let rm = ss(0.40, 0.60, r + (hi - 0.5) * 0.3) * (1.0 - cm);
     let om = ss(0.25, 0.7, o + (hi - 0.5) * 0.3);
+    let bm = ss(0.30, 0.55, b + (hi - 0.5) * 0.2) * (1.0 - cm);
     let ridged = 1.0 - (2.0 * fbm(u * 2.2, v * 2.2, 31, 3) - 1.0).abs();
     let crack = ss(0.90, 0.98, ridged) * rm;
     let dust = (1.0 - rm - cm).max(0.0);
     let ripple = ((u * 1.5 + v * 6.0 + fbm(u * 0.6, v * 0.6, 9, 2) * 9.0).sin() * 0.5 + 0.5) * dust;
-    let h = cm * (0.7 + 0.5 * lo + 0.25 * hi) + rm * (0.10 + 0.05 * hi) - crack * 0.06 + ripple * 0.07 + hi * 0.035;
-    S { h, rm, cm, om, lo, hi, crack, ripple }
+    let h = cm * (0.7 + 0.5 * lo + 0.25 * hi) + rm * (0.10 + 0.05 * hi) + bm * 0.12 * hi - crack * 0.06 + ripple * 0.07 + hi * 0.035;
+    S { h, rm, cm, om, bm, lo, hi, crack, ripple }
 }
 
 struct Baked {
@@ -134,7 +150,7 @@ fn bake(w: &Snap, cx: i32, cy: i32) -> Baked {
                 Vec3::new(0.35, 0.33, 0.35).lerp(Vec3::new(0.48, 0.45, 0.43), s.lo) * (0.82 + 0.36 * s.hi) * (1.0 - 0.55 * s.crack);
             let strata = 0.88 + 0.12 * (s.h * 38.0).sin();
             let cliff = Vec3::new(0.30, 0.23, 0.21).lerp(Vec3::new(0.47, 0.37, 0.30), s.hi) * strata;
-            let mut col = dust.lerp(rock, s.rm).lerp(cliff, s.cm);
+            let mut col = dust.lerp(rock, s.rm).lerp(cliff, s.cm.max(s.bm));
             let glow = s.om * (0.45 + 0.55 * s.hi);
             col = col.lerp(Vec3::new(0.80, 0.34, 0.07), glow * 0.6);
 
@@ -160,6 +176,9 @@ fn bake(w: &Snap, cx: i32, cy: i32) -> Baked {
                 col = Vec3::new(g, g, g * 1.03);
                 lum = 1.0;
             }
+            // Higher ground is a touch brighter, so plateaus read as raised.
+            let (wu, wv) = (gx as f32 / TPX as f32, gy as f32 / TPX as f32);
+            lum *= 1.0 + 0.07 * ground_h(&w.corners, wu, wv) / LEVEL_H;
             let out = (col * lum * (1.0 + grain * 0.07) + Vec3::new(0.28, 0.09, 0.0) * glow * 0.5).clamp(Vec3::ZERO, Vec3::ONE);
             let i = (y * PW + x) * 4;
             bytes[i] = (out.x * 255.0) as u8;
@@ -172,7 +191,7 @@ fn bake(w: &Snap, cx: i32, cy: i32) -> Baked {
         for vx in 0..VN {
             let u = (cx * CT) as f32 + vx as f32 / SUB as f32;
             let v = (cy * CT) as f32 + vy as f32 / SUB as f32;
-            heights[vy * VN + vx] = sample(w, u, v).macro_h() * CLIFF_H;
+            heights[vy * VN + vx] = sample(w, u, v).macro_h() * CLIFF_H + ground_h(&w.corners, u, v);
         }
     }
     Baked { cx, cy, sig: signature(w, cx, cy), bytes, heights }
@@ -277,6 +296,8 @@ pub struct TerrainView {
     fog_gen: Option<u32>,
     /// Fog level per tile as last written to the meshes.
     fog_seen: Vec<f32>,
+    /// Corner heights of the current map, shared with the bake threads.
+    corners: Arc<Vec<f32>>,
 }
 
 impl TerrainView {
@@ -306,6 +327,7 @@ impl TerrainView {
             done: SyncCell::new(done),
             fog_gen: None,
             fog_seen: vec![-1.0; (MAP_W * MAP_H) as usize],
+            corners: Arc::new(Vec::new()),
         }
     }
 
@@ -352,7 +374,8 @@ fn accept(
             });
             let mut e = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat), Transform::IDENTITY));
             // Flat ground cannot shadow anything; only chunks with cliffs go into the shadow map.
-            if b.heights.iter().all(|h| *h < 0.02) {
+            let (lo, hi) = b.heights.iter().fold((f32::MAX, f32::MIN), |(a, c), h| (a.min(*h), c.max(*h)));
+            if hi - lo < 0.02 {
                 e.insert(bevy::light::NotShadowCaster);
             }
             let entity = e.id();
@@ -393,7 +416,10 @@ pub fn update(
     let missing = (0..tv.chunks.len()).any(|i| visible(i) && tv.chunks[i].is_none() && !tv.pending[i]);
     if missing || tv.timer <= 0.0 {
         tv.timer = 0.2;
-        let snap = Snap { terrain: w.terrain.clone(), ore: w.ore.clone(), slab: w.slab.clone() };
+        if tv.corners.len() != g.corners.len() || tv.corners.as_slice() != g.corners.as_slice() {
+            tv.corners = Arc::new(g.corners.clone());
+        }
+        let snap = Snap { terrain: w.terrain.clone(), ore: w.ore.clone(), slab: w.slab.clone(), corners: tv.corners.clone() };
         let mut order: Vec<usize> = (0..tv.chunks.len()).filter(|i| !tv.pending[*i]).collect();
         order.sort_by_key(|i| !visible(*i));
         let stale: Vec<usize> =
