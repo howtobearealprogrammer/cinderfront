@@ -125,7 +125,10 @@ fn setup(mut commands: Commands, server: Res<AssetServer>, mut images: ResMut<As
     let font: Handle<Font> = server.load(FONT);
     let n = 192u32;
     let mm = images.add(rgba_image(n, n, vec![0; (n * n * 4) as usize], RenderAssetUsages::all()));
-    commands.spawn((Camera2d, Camera { order: 1, clear_color: ClearColorConfig::None, ..default() }));
+    // Same MSAA setting as the 3D camera (scene.rs): cameras that differ get separate
+    // render textures, and this one never clears its own, so it would paint stale UI
+    // over the map.
+    commands.spawn((Camera2d, Msaa::Off, Camera { order: 1, clear_color: ClearColorConfig::None, ..default() }));
 
     // Menu: a centred column of lines.
     commands

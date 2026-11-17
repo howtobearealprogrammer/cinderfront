@@ -21,6 +21,7 @@ cargo test -- --nocapture           # some tests print map / balance stats
 Debug environment variables (all read in `src/main.rs`):
 
 - `CF_SHOT=out.png` — take a screenshot after `CF_SHOT_AT` seconds (default 8) and quit; forces windowed. This is the way to check visuals without a human.
+- `CF_AUTO_SOLO=secs` — start a solo game from the main menu after that many seconds. Use with `CF_SHOT` to cover the menu → match path, which behaves differently from launching straight into `solo` / `demo`. `CF_FULLSCREEN=1` keeps a screenshot run in fullscreen.
 - `CF_RES=WxH` — window size (forces windowed). `CF_ZOOM` — starting zoom, demo only.
 - `CF_PERF=1` — log average / worst frame time to stderr every 2 s.
 - `CF_REVEAL=1` — no fog of war (pair with `CF_SHOT` and `CF_ZOOM` to see the whole map).
@@ -60,7 +61,7 @@ Data flows one way: input → `Game` → `Command` → sim → `Game` → render
 
 - `game.rs` — `Game` owns the `World` plus all client-only state: camera, selection, control groups, fog of war, ghosts of last-seen enemy structures, particles. It never mutates the sim; `Game::frame` returns the `Command`s the player issued. Fog is purely a view filter — the sim knows nothing about it. `Game::context()` decides both the cursor shape and what a right click does, so the two cannot disagree. HUD layout constants and HUD click handling also live here.
 - `main.rs` — `run_session` (system set `RunGame`) is the menu / lobby / match state machine and runs before anything draws. The live `Game` sits in the `View(Option<Game>)` resource.
-- `scene.rs`, `terrain.rs`, `hud.rs`, `cursor.rs` — read `View` each frame and mirror it into Bevy entities. Nothing here feeds back into the sim. These write components only when values change (Bevy re-lays-out UI and re-propagates transforms otherwise); keep that pattern when adding HUD or scene sync code.
+- `scene.rs`, `terrain.rs`, `hud.rs`, `cursor.rs` — read `View` each frame and mirror it into Bevy entities. Nothing here feeds back into the sim. The 3D camera (`scene.rs`) and the UI camera (`hud.rs`) draw to the same window and must have the same `Msaa` setting; if they differ, the UI camera gets its own never-cleared texture and paints stale menu / sidebar frames over the map. These write components only when values change (Bevy re-lays-out UI and re-propagates transforms otherwise); keep that pattern when adding HUD or scene sync code.
 
 ### Terrain height
 

@@ -386,7 +386,7 @@ fn run_session(
                 m.msg = "Can't host a new game until your last match finishes".into();
             } else if keys.just_pressed(KeyCode::KeyH) {
                 next = Some(host(net::TCP_PORT, 0));
-            } else if keys.just_pressed(KeyCode::KeyS) {
+            } else if keys.just_pressed(KeyCode::KeyS) || auto_solo(time.elapsed_secs()) {
                 next = Some(solo(&mut view));
             } else if keys.just_pressed(KeyCode::KeyJ) || keys.just_pressed(KeyCode::Enter) {
                 if !m.ip.is_empty() {
@@ -559,6 +559,14 @@ fn run_session(
     }
 }
 
+/// CF_AUTO_SOLO=secs (debug): start a solo game from the menu after that long,
+/// so a screenshot run can cover the menu -> match path.
+fn auto_solo(now: f32) -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let at = std::env::var("CF_AUTO_SOLO").ok().and_then(|v| v.parse::<f32>().ok());
+    at.is_some_and(|t| now > t) && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// CF_PERF=1: every 2 s, log average / worst frame time and FPS to stderr.
 fn perf_log(time: Res<Time<Real>>, mut acc: Local<(f32, f32, u32)>) {
     if std::env::var_os("CF_PERF").is_none() {
@@ -626,7 +634,9 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     // Fullscreen by default; `--windowed` (or a screenshot run) opens a 1280x800 window.
-    let windowed = args.iter().any(|a| a == "--windowed") || std::env::var_os("CF_SHOT").is_some() || std::env::var_os("CF_RES").is_some();
+    // CF_FULLSCREEN=1 keeps fullscreen for a screenshot run.
+    let windowed = args.iter().any(|a| a == "--windowed")
+        || ((std::env::var_os("CF_SHOT").is_some() || std::env::var_os("CF_RES").is_some()) && std::env::var_os("CF_FULLSCREEN").is_none());
     let args: Vec<String> = args.into_iter().filter(|a| a != "--windowed").collect();
     let mut view = View::default();
     let screen = match args.get(1).map(|s| s.as_str()) {
