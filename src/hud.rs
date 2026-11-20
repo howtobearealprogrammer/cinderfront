@@ -571,8 +571,16 @@ fn update_icons(
                 let q = &pl.queues[TRAIN_AT.iter().position(|s| *s == d.made_at).unwrap()];
                 let n = q.items.iter().filter(|k| **k == kind).count();
                 let progress = (q.items.front() == Some(&kind)).then(|| q.spent as f32 / d.cost as f32);
-                let tag = if n > 0 { format!("x{n}") } else { String::new() };
-                (g.unit_needs(kind), d.cost, g.world.can_train(g.me, kind), progress, tag, g.icon_rect(i, true))
+                // Supply committed / cap for the unit's pool, then how many are queued.
+                let mut tag = match kind.supply().map(|(pool, _)| g.world.supply(g.me, pool)) {
+                    Some((used, cap)) if cap > 0 => format!("{used}/{cap}"),
+                    _ => String::new(),
+                };
+                if n > 0 {
+                    tag = format!("{tag} x{n}").trim_start().to_string();
+                }
+                let enabled = g.world.can_train(g.me, kind) && g.world.has_supply(g.me, kind);
+                (g.unit_needs(kind), d.cost, enabled, progress, tag, g.icon_rect(i, true))
             }
         };
         let hover = rect.contains(m) && enabled;

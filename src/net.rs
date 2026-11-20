@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 pub const TCP_PORT: u16 = 47810;
 pub const UDP_PORT: u16 = 47811;
-const MAGIC: &str = "CINDERFRONT1";
+const MAGIC: &str = "CINDERFRONT2";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum C2H {

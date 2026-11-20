@@ -419,3 +419,36 @@ fn formation_keeps_shape_and_pace() {
     assert_eq!(tf.1, ts.1);
     assert_eq!(w.units[&fast].speed_cap, 0, "cap lifted on arrival");
 }
+
+#[test]
+fn supply_caps_limit_training() {
+    use cinderfront::sim::Pool;
+    let mut w = World::new(7, 2);
+    w.players[0].credits += 50_000;
+    build(&mut w, 0, StructKind::Power);
+    build(&mut w, 0, StructKind::Refinery);
+    build(&mut w, 0, StructKind::Power);
+    build(&mut w, 0, StructKind::Factory);
+    build(&mut w, 0, StructKind::Airpad);
+
+    // One refinery: the harvester it came with plus one more.
+    assert_eq!(w.supply(0, Pool::Harvest), (1, 2));
+    for _ in 0..3 {
+        w.apply(0, &Command::Train(UnitKind::Harvester));
+    }
+    assert_eq!(w.supply(0, Pool::Harvest), (2, 2), "queued units hold their points");
+    assert_eq!(w.players[0].queues[1].items.len(), 1);
+
+    // One airpad holds 20 points: four carriers at 5 each.
+    for _ in 0..6 {
+        w.apply(0, &Command::Train(UnitKind::Carrier));
+    }
+    assert_eq!(w.players[0].queues[2].items.len(), 4);
+    w.apply(0, &Command::CancelTrain(UnitKind::Carrier));
+    assert_eq!(w.supply(0, Pool::Air), (15, 20));
+
+    // A second airpad raises the cap wherever it stands.
+    build(&mut w, 0, StructKind::Power);
+    build(&mut w, 0, StructKind::Airpad);
+    assert_eq!(w.supply(0, Pool::Air).1, 40);
+}

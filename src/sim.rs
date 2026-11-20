@@ -110,6 +110,20 @@ impl UnitKind {
         }
     }
 
+    /// Supply pool this unit counts against and the points it takes. The MCV is exempt.
+    pub fn supply(self) -> Option<(Pool, i32)> {
+        match self {
+            UnitKind::Trooper => Some((Pool::Infantry, 1)),
+            UnitKind::Rocketeer => Some((Pool::Infantry, 3)),
+            UnitKind::Explorer => Some((Pool::Ground, 1)),
+            UnitKind::Buggy => Some((Pool::Ground, 3)),
+            UnitKind::Tank => Some((Pool::Ground, 5)),
+            UnitKind::Harvester => Some((Pool::Harvest, 1)),
+            UnitKind::Carrier | UnitKind::Gunship => Some((Pool::Air, 5)),
+            UnitKind::Mcv => None,
+        }
+    }
+
     pub fn def(self) -> UnitDef {
         use StructKind::*;
         let d = |name, cost, hp, speed, range, damage, cooldown, hits_air, air, vs_struct, made_at, requires| UnitDef {
@@ -136,6 +150,28 @@ impl UnitKind {
             UnitKind::Gunship => d("Gunship", 800, 220, 80, 4, 12, 6, true, true, 60, Airpad, Some(TechLab)),
             UnitKind::Explorer => d("Explorer", 200, 100, 70, 0, 0, 0, false, false, 0, Factory, None),
             UnitKind::Mcv => d("MCV", 2500, 800, 16, 0, 0, 0, false, false, 0, Factory, Some(TechLab)),
+        }
+    }
+}
+
+/// Supply pools. Every unit kind except the MCV draws points from one pool, and each
+/// standing building of the pool's kind raises that pool's cap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pool {
+    Infantry,
+    Ground,
+    Air,
+    Harvest,
+}
+
+impl Pool {
+    /// The building that raises this pool's cap, and the points each one adds.
+    pub fn source(self) -> (StructKind, i32) {
+        match self {
+            Pool::Infantry => (StructKind::Barracks, 50),
+            Pool::Ground => (StructKind::Factory, 50),
+            Pool::Air => (StructKind::Airpad, 20),
+            Pool::Harvest => (StructKind::Refinery, 2),
         }
     }
 }
@@ -601,6 +637,24 @@ impl World {
         self.has_struct(p, d.made_at) && d.requires.map_or(true, |r| self.has_struct(p, r))
     }
 
+    /// Points committed in a pool (living units plus everything queued) and the pool's cap.
+    pub fn supply(&self, p: u8, pool: Pool) -> (i32, i32) {
+        let pts = |k: UnitKind| k.supply().filter(|s| s.0 == pool).map_or(0, |s| s.1);
+        let live: i32 = self.units.values().filter(|u| u.owner == p && u.hp > 0).map(|u| pts(u.kind)).sum();
+        let queued: i32 = self.players[p as usize].queues.iter().flat_map(|q| q.items.iter()).map(|k| pts(*k)).sum();
+        let (kind, per) = pool.source();
+        let n = self.structs.values().filter(|s| s.owner == p && s.kind == kind).count() as i32;
+        (live + queued, n * per)
+    }
+
+    /// Whether one more `kind` fits under its pool's cap.
+    pub fn has_supply(&self, p: u8, kind: UnitKind) -> bool {
+        kind.supply().map_or(true, |(pool, pts)| {
+            let (used, cap) = self.supply(p, pool);
+            used + pts <= cap
+        })
+    }
+
     pub fn place_tile_ok(&self, kind: StructKind, x: i32, y: i32) -> bool {
         if !inb(x, y) {
             return false;
@@ -952,7 +1006,8 @@ impl World {
         // Bare rock is a poor footing: structures start damaged without slabs.
         let hp = d.hp * (50 + 50 * slabbed / (d.w * d.h)) / 100;
         let sid = self.create_struct(p, kind, x, y, hp);
-        if kind == StructKind::Refinery {
+        // Each refinery brings a harvester, unless a rebuilt one would exceed the harvester cap.
+        if kind == StructKind::Refinery && self.has_supply(p, UnitKind::Harvester) {
             self.spawn_at_struct(p, UnitKind::Harvester, sid);
         }
     }
@@ -1020,7 +1075,7 @@ impl World {
             }
             Command::Train(kind) => {
                 let q = TRAIN_AT.iter().position(|s| *s == kind.def().made_at).unwrap();
-                if self.can_train(p, *kind) && self.players[pi].queues[q].items.len() < 12 {
+                if self.can_train(p, *kind) && self.has_supply(p, *kind) && self.players[pi].queues[q].items.len() < 12 {
                     self.players[pi].queues[q].items.push_back(*kind);
                 }
             }
@@ -1385,6 +1440,13 @@ impl World {
                     pl.queues[q].items.clear();
                     continue;
                 };
+                // A lost building can leave the queue over the cap: hold until it fits again.
+                if kind.supply().is_some_and(|(pool, _)| {
+                    let (used, cap) = self.supply(p as u8, pool);
+                    used > cap
+                }) {
+                    continue;
+                }
                 let cost = kind.def().cost;
                 let pl = &mut self.players[p];
                 let pay = rate.min(cost - pl.queues[q].spent).min(pl.credits);

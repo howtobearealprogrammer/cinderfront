@@ -677,7 +677,9 @@ impl Game {
 
     pub fn unit_needs(&self, kind: UnitKind) -> Option<&'static str> {
         let (w, d) = (&self.world, kind.def());
-        [Some(d.made_at), d.requires].into_iter().flatten().find(|r| !w.has_struct(self.me, *r)).map(|r| r.def().name)
+        // At the supply cap, the missing thing is another building of the pool's kind.
+        let cap = kind.supply().filter(|_| !w.has_supply(self.me, kind)).map(|(pool, _)| pool.source().0);
+        [Some(d.made_at), d.requires, cap].into_iter().flatten().find(|r| Some(*r) == cap || !w.has_struct(self.me, *r)).map(|r| r.def().name)
     }
 
     /// Own structures plus enemy structures as last seen.
@@ -1204,7 +1206,7 @@ impl Game {
             if self.icon_rect(i, true).contains(m) {
                 if !left {
                     out.push(Command::CancelTrain(*kind));
-                } else if w.can_train(me, *kind) {
+                } else if w.can_train(me, *kind) && w.has_supply(me, *kind) {
                     out.push(Command::Train(*kind));
                 }
             }
