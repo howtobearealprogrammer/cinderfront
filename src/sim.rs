@@ -767,6 +767,19 @@ impl World {
         None
     }
 
+    /// Nearest tile to `t` that no aircraft is sitting on or flying to.
+    fn free_air_tile_near(&self, t: Tile) -> Tile {
+        let taken = |x: Tile| {
+            self.units.values().any(|u| {
+                u.kind.def().air && u.hp > 0 && (u.tile == x || matches!(u.order, Order::Move(d) | Order::AttackMove(d) if d == x))
+            })
+        };
+        (0..=8i32)
+            .flat_map(|r| (-r..=r).flat_map(move |dy| (-r..=r).filter(move |dx| dx.abs().max(dy.abs()) == r).map(move |dx| (t.0 + dx, t.1 + dy))))
+            .find(|x| inb(x.0, x.1) && !taken(*x))
+            .unwrap_or(t)
+    }
+
     fn spread(&self, t: Tile, n: usize) -> Vec<Tile> {
         let mut out = Vec::with_capacity(n);
         for r in 0..=12i32 {
@@ -977,7 +990,9 @@ impl World {
         let d = s.kind.def();
         let rally = s.rally;
         let air = kind.def().air;
-        let tile = if air { (s.x + d.w / 2, s.y + d.h / 2) } else { self.free_tile_near((s.x + d.w / 2, s.y + d.h), 6)? };
+        // Aircraft ignore ground occupancy, so keep them off each other's tiles here.
+        let tile = if air { self.free_air_tile_near((s.x + d.w / 2, s.y + d.h / 2)) } else { self.free_tile_near((s.x + d.w / 2, s.y + d.h), 6)? };
+        let rally = rally.map(|r| if air { self.free_air_tile_near(r) } else { r });
         let id = self.new_unit(owner, kind, tile);
         if let Some(r) = rally {
             let ore = self.terrain[idx(r.0, r.1)] == Terrain::Ore;

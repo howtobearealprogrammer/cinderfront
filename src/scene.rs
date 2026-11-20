@@ -687,8 +687,15 @@ fn draw_overlays(view: Res<View>, mut gz: Gizmos<OverlayGizmos>, mut bars: Gizmo
             rgba(1.0, 0.25, 0.15, 1.0)
         };
         let a = at - Vec3::X * len / 2.0;
-        bars.line(a - Vec3::X * 0.03, a + Vec3::X * (len + 0.03), Color::srgba(0.0, 0.0, 0.0, 0.85));
-        bars.line(a, a + Vec3::X * len * frac, col(c));
+        // Filled and empty parts are separate segments: bars all sit at the same depth, so a
+        // backing line under the fill would fight with it and hide the colour.
+        let mid = a + Vec3::X * len * frac;
+        if frac > 0.0 {
+            bars.line(a, mid, col(c));
+        }
+        if frac < 1.0 {
+            bars.line(mid, a + Vec3::X * len, Color::srgba(0.0, 0.0, 0.0, 0.85));
+        }
     };
     for u in w.units.values().filter(|u| !u.carried && g.unit_visible(u)) {
         let frac = u.hp as f32 / u.kind.def().hp as f32;

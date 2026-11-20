@@ -474,3 +474,18 @@ fn extra_production_buildings_train_faster() {
     let (one, two) = (time(1), time(2));
     assert!(two < one && two * 10 >= one * 6, "one barracks {one} ticks, two {two}");
 }
+
+#[test]
+fn new_aircraft_do_not_stack() {
+    let mut w = World::new(7, 2);
+    w.players[0].credits += 50_000;
+    for k in [StructKind::Power, StructKind::Refinery, StructKind::Power, StructKind::Factory, StructKind::Airpad] {
+        build(&mut w, 0, k);
+    }
+    let ids: Vec<u32> = (0..4).map(|_| train(&mut w, 0, UnitKind::Carrier)).collect();
+    run(&mut w, 100);
+    let mut tiles: Vec<_> = ids.iter().map(|id| w.units[id].tile).collect();
+    tiles.sort();
+    tiles.dedup();
+    assert_eq!(tiles.len(), 4, "each carrier gets its own tile");
+}
