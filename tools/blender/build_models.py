@@ -45,6 +45,7 @@ MATERIALS = {
     "Steel": ((0.16, 0.16, 0.18), 0.5, 0.35, None, 0.0),
     "Hull": ((0.56, 0.57, 0.62), 0.6, 0.15, None, 0.0),
     "Wall": ((0.40, 0.41, 0.45), 0.7, 0.05, None, 0.0),
+    "Deck": ((0.30, 0.31, 0.35), 0.75, 0.1, None, 0.0),
     "Concrete": ((0.62, 0.61, 0.60), 0.8, 0.0, None, 0.0),
     "Asphalt": ((0.24, 0.25, 0.28), 0.85, 0.0, None, 0.0),
     "Dark": ((0.05, 0.05, 0.06), 0.8, 0.0, None, 0.0),
@@ -191,11 +192,32 @@ class Part:
         bmesh.ops.recalc_face_normals(bm, faces=list(dict.fromkeys(f for v in verts for f in v.link_faces)))
         self._finish_prim(verts, m)
 
-    def to_object(self, name, parent, pivot=(0.0, 0.0, 0.0), coll=None):
-        """Create the mesh object. `pivot` is in final (tile) coordinates relative to the parent."""
+    def poly(self, x, y, z0, z1, pts, m, top=(1.0, 1.0), shift=(0.0, 0.0), bevel=0.0):
+        """Prism over the convex outline `pts` (XY offsets from (x, y), counter-clockwise).
+        `top` scales the top outline, `shift` moves it."""
+        bm = self.bm
+        lo = [bm.verts.new(self.P(x + px, y + py, z0)) for px, py in pts]
+        hi = [bm.verts.new(self.P(x + px * top[0] + shift[0], y + py * top[1] + shift[1], z1)) for px, py in pts]
+        n = len(pts)
+        bm.faces.new(hi)
+        bm.faces.new(lo[::-1])
+        for i in range(n):
+            bm.faces.new((lo[i], lo[(i + 1) % n], hi[(i + 1) % n], hi[i]))
+        self._finish_prim(lo + hi, m, bevel)
+
+    def cbox(self, x, y, z0, z1, hx, hy, c, m, top=(1.0, 1.0), shift=(0.0, 0.0), bevel=0.0):
+        """Box with its four vertical corners clipped by `c` (octagonal footprint)."""
+        pts = [(hx - c, -hy), (hx, -hy + c), (hx, hy - c), (hx - c, hy),
+               (-hx + c, hy), (-hx, hy - c), (-hx, -hy + c), (-hx + c, -hy)]
+        self.poly(x, y, z0, z1, pts, m, top, shift, bevel)
+
+    def to_object(self, name, parent, pivot=(0.0, 0.0, 0.0), coll=None, local=False):
+        """Create the mesh object. `pivot` is in final (tile) coordinates relative to the parent.
+        `local` means the geometry was already built around the pivot (origin = pivot)."""
         bm = self.bm
         pv = Vector(pivot)
-        bmesh.ops.translate(bm, vec=-pv, verts=bm.verts)
+        if not local:
+            bmesh.ops.translate(bm, vec=-pv, verts=bm.verts)
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         # Triangulate here with fixed methods so the exported index order is reproducible.
         bmesh.ops.triangulate(bm, faces=bm.faces[:], quad_method='FIXED', ngon_method='EAR_CLIP')
@@ -266,10 +288,10 @@ class Model:
         self.coll.objects.link(self.root)
         self.parts = {}
 
-    def add(self, part_name, part, pivot=(0.0, 0.0, 0.0)):
+    def add(self, part_name, part, pivot=(0.0, 0.0, 0.0), local=False):
         # Blender object names are global, so non-root objects carry a "<model>:" prefix
         # that is stripped from the GLB afterwards (see patch_glb).
-        ob = part.to_object(f"{self.name}:{part_name}", self.root, pivot, self.coll)
+        ob = part.to_object(f"{self.name}:{part_name}", self.root, pivot, self.coll, local)
         ob["gltf_name"] = part_name
         self.parts[part_name] = ob
         return ob
@@ -480,8 +502,8 @@ def build_carrier():
     P.box(-12.0, 0, 8.0, 17.0, 3.2, 2.2, "Hull", taper=(0.7, 0.8))  # rear pylon
     P.box(-12.0, 0, 13.0, 15.0, 3.0, 2.3, "Team", bevel=0.0)
     M.add("body", P)
-    M.add("rotor", rotor_part(11.0, CK, blades=3), pivot=(12.0 * CK, 0.0, 14.0 * CK))
-    M.add("rotor2", rotor_part(11.0, CK, blades=3), pivot=(-12.0 * CK, 0.0, 17.0 * CK))
+    M.add("rotor", rotor_part(11.0, CK, blades=3), pivot=(12.0 * CK, 0.0, 14.0 * CK), local=True)
+    M.add("rotor2", rotor_part(11.0, CK, blades=3), pivot=(-12.0 * CK, 0.0, 17.0 * CK), local=True)
     return M
 
 
@@ -506,7 +528,7 @@ def build_gunship():
     P.cyl((11.0, 0, 0.6), (15.0, 0, 0.6), 0.5, "Steel", seg=6)  # chin gun
     P.cylz(1.0, 0, 6.5, 9.5, 1.0, "Steel", seg=8)  # mast
     M.add("body", P)
-    M.add("rotor", rotor_part(16.0, PX, blades=2), pivot=(1.0 * PX, 0.0, 10.5 * PX))
+    M.add("rotor", rotor_part(16.0, PX, blades=2), pivot=(1.0 * PX, 0.0, 10.5 * PX), local=True)
     return M
 
 
@@ -529,54 +551,150 @@ class Bldg:
         return (0.5 - fy) * self.H
 
 
-def base_block(P, B, ht, wall="Wall", roof="Hull", stripe=True):
-    """Plinth over the whole (inset) footprint, main block set back `B.front` from the
-    south edge so door details on the south face stay inside the footprint."""
+def base_block(P, B, ht, wall="Wall", roof="Deck", stripe=True):
+    """Clipped-corner plinth over the whole (inset) footprint, main block set back `B.front`
+    from the south edge so door details on the south face stay inside the footprint.
+    Adds a sloped footing, a panel seam, corner pylons, wall ribs and a roof parapet."""
     hx, hy = B.hx, B.hy
-    n, s = hy - 0.02, -(hy - B.front)
+    wx = hx - 0.04
+    n, s = hy - 0.04, -(hy - B.front)
     yc, hh = (n + s) / 2, (n - s) / 2
-    P.box(0, 0, 0, 0.05, hx, hy, "Steel", bevel=0.01)  # plinth
-    P.box(0, yc, 0.05, ht, hx - 0.02, hh, wall)
-    P.box(0, yc, ht, ht + 0.03, hx - 0.06, hh - 0.04, roof, bevel=0.008)
+    P.cbox(0, 0, 0, 0.05, hx, hy, 0.09, "Steel", bevel=0.008)  # plinth
+    P.box(0, yc, 0.05, 0.11, wx + 0.012, hh + 0.012, "Steel", bevel=0.0,
+          taper=(wx / (wx + 0.012), hh / (hh + 0.012)))  # footing
+    P.box(0, yc, 0.05, ht, wx, hh, wall)
+    P.box(0, yc, 0.135, 0.145, wx + 0.003, hh + 0.003, "Dark", bevel=0.0)  # panel seam
     if stripe:
-        P.box(0, yc, ht - 0.09, ht - 0.02, hx - 0.012, hh + 0.008, "Team", bevel=0.0)
+        P.box(0, yc, ht - 0.1, ht - 0.04, wx + 0.006, hh + 0.006, "Team", bevel=0.0)
+    P.box(0, yc, ht, ht + 0.012, wx - 0.035, hh - 0.035, roof, bevel=0.0)  # roof deck
+    for a in (-1, 1):
+        P.box(0, yc + a * (hh - 0.02), ht, ht + 0.04, wx, 0.02, "Hull", bevel=0.005)  # parapet
+        P.box(a * (wx - 0.02), yc, ht, ht + 0.04, 0.02, hh, "Hull", bevel=0.005)
+        for cy in (n - 0.035, s + 0.035):  # corner pylons
+            cx = a * (wx - 0.035)
+            P.cbox(cx, cy, 0.05, ht + 0.07, 0.065, 0.065, 0.02, "Hull", top=(0.8, 0.8))
+            P.box(cx, cy, ht + 0.07, ht + 0.082, 0.035, 0.035, "Team", bevel=0.0)
+    rib_top = ht - 0.12
+    if rib_top > 0.12:  # wall ribs on the north, east and west faces
+        kx = int(B.W * 1.5) - 1
+        for i in range(kx):
+            P.box(-wx + 2 * wx * (i + 1) / (kx + 1), n, 0.05, rib_top, 0.04, 0.022, "Hull", taper=(0.6, 1.0))
+        ky = int(B.H * 1.5) - 1
+        for i in range(ky):
+            y = s + 2 * hh * (i + 1) / (ky + 1)
+            for a in (-1, 1):
+                P.box(a * wx, y, 0.05, rib_top, 0.022, 0.04, "Hull", taper=(1.0, 0.6))
 
 
 def south_face(B):
     return -(B.hy - B.front)
 
 
+def bay_door(P, x, sf, hw, h, slats=4, light="Lamp"):
+    """Recessed door on the south face with jambs, a hazard-striped lintel and a light strip."""
+    P.box(x, sf - 0.005, 0.05, h, hw, 0.02, "Dark", bevel=0.0)
+    for k in range(slats):
+        z = 0.05 + (k + 1) * (h - 0.05) / (slats + 1)
+        P.box(x, sf - 0.026, z, z + 0.012, hw - 0.015, 0.004, "Steel", bevel=0.0)
+    for a in (-1, 1):
+        P.box(x + a * (hw + 0.03), sf - 0.02, 0.05, h, 0.03, 0.035, "Hull", bevel=0.006)
+    P.box(x, sf - 0.02, h, h + 0.07, hw + 0.06, 0.035, "Hull", bevel=0.006)
+    n = max(4, 2 * round(hw / 0.09))
+    for i in range(n):
+        cx = x - hw + (i + 0.5) * 2 * hw / n
+        P.box(cx, sf - 0.056, h + 0.03, h + 0.055, hw / n, 0.003, "Hazard" if i % 2 == 0 else "Dark", bevel=0.0)
+    P.box(x, sf - 0.056, h + 0.008, h + 0.022, hw, 0.003, light, bevel=0.0)
+
+
+def fan(P, x, y, z, r):
+    P.cylz(x, y, z, z + 0.06, r, "Steel", seg=20)
+    P.cylz(x, y, z + 0.06, z + 0.066, r * 0.84, "Dark", seg=20)
+    for i in range(3):
+        P.box(x, y, z + 0.064, z + 0.078, r * 0.8, r * 0.13, "Hull", bevel=0.0, rz=0.3 + i * math.pi / 3)
+    P.cylz(x, y, z + 0.06, z + 0.09, r * 0.22, "Steel", seg=10)
+
+
+def vent_box(P, x, y, z, hx, hy, h=0.07):
+    P.box(x, y, z, z + h, hx, hy, "Steel", taper=(0.9, 0.9))
+    n = max(2, round(hx / 0.035))
+    w = 1.6 * hx / n
+    for i in range(n):
+        P.box(x - 0.8 * hx + (i + 0.5) * w, y, z + h, z + h + 0.008, w * 0.28, hy * 0.75, "Dark", bevel=0.0)
+
+
+def mast(P, x, y, z0, z1, lamp="RedLamp", bars=3):
+    P.cbox(x, y, z0, z0 + 0.05, 0.065, 0.065, 0.02, "Steel", top=(0.7, 0.7))
+    P.cylz(x, y, z0 + 0.05, z1, 0.018, "Steel", r1=0.01, seg=8)
+    for k in range(bars):
+        z = z0 + (z1 - z0) * (0.45 + 0.17 * k)
+        P.box(x, y, z, z + 0.014, 0.1 - 0.025 * k, 0.01, "Hull", bevel=0.0)
+    P.sphere(x, y, z1 + 0.02, 0.03, lamp, seg=8, rings=4)
+
+
+def dish(P, x, y, z, r, yaw=0.0, elev=0.9):
+    """Radar dish on a pedestal, facing `yaw` (radians from +X) and tilted up by `elev`."""
+    P.cylz(x, y, z, z + 0.08, r * 0.5, "Steel", r1=r * 0.3, seg=12)
+    P.cylz(x, y, z + 0.08, z + r * 0.9, r * 0.12, "Steel", seg=8)
+    c = Vector((x, y, z + r * 0.95))
+    d = Vector((math.cos(yaw) * math.cos(elev), math.sin(yaw) * math.cos(elev), math.sin(elev)))
+    back, front = c - d * r * 0.1, c + d * r * 0.3
+    P.cyl(tuple(back), tuple(front), r * 0.18, "Paint", r1=r, seg=24)
+    P.cyl(tuple(front), tuple(front + d * 0.005), r * 0.9, "Deck", seg=24)
+    P.cyl(tuple(front), tuple(front + d * r * 0.5), r * 0.04, "Steel", seg=6)
+    tip = front + d * r * 0.5
+    P.sphere(tip.x, tip.y, tip.z, r * 0.1, "RedLamp", seg=8, rings=4)
+
+
+def tank(P, x, y, z0, z1, r, m="Hull", bands=3, seg=24):
+    P.cylz(x, y, z0, z1, r, m, seg=seg)
+    P.sphere(x, y, z1, r, m, scale=(1, 1, 0.4), seg=seg, rings=8, hemi=True)
+    for k in range(bands):
+        z = z0 + (z1 - z0) * (k + 1) / (bands + 1)
+        P.cylz(x, y, z - 0.012, z + 0.012, r + 0.006, "Steel", seg=seg)
+
+
+def pipe(P, pts, r, m="Pipe", seg=10):
+    for a, b in zip(pts, pts[1:]):
+        P.cyl(a, b, r, m, seg=seg)
+    for p in pts[1:-1]:
+        P.sphere(p[0], p[1], p[2], r * 1.15, m, seg=seg, rings=6)
+
+
 def build_yard():
     B = Bldg("yard")
     M = Model("yard")
     P = Part()
-    ht = 0.55
+    ht = 0.5
     base_block(P, B, ht)
     sf = south_face(B)
-    for i in range(5):
-        wx = B.X(0.14 + 0.18 * i)
-        P.box(wx, sf, 0.16, 0.34, 0.11, 0.015, "Window", bevel=0.0)
-    # Command tower.
-    tx, ty = B.X(0.39), B.Y(0.48)
-    P.box(tx, ty, ht, ht + 0.36, 0.75, 0.8, "Hull", taper=(0.95, 0.95))
-    P.box(tx, ty, ht + 0.25, ht + 0.32, 0.725, 0.775, "Team", bevel=0.0)
-    for i in range(4):
-        P.box(tx - 0.52 + 0.35 * i, ty - 0.8, ht + 0.08, ht + 0.21, 0.11, 0.02, "Glass", bevel=0.0)
-    P.box(tx, ty, ht + 0.36, ht + 0.39, 0.45, 0.42, "Steel", bevel=0.005)  # roof pad
-    P.box(tx, ty, ht + 0.39, ht + 0.40, 0.3, 0.06, "Paint", bevel=0.0)
-    P.box(tx, ty, ht + 0.39, ht + 0.40, 0.06, 0.3, "Paint", bevel=0.0)
-    # Radar mast with dish.
-    mx, my = B.X(0.82), B.Y(0.4)
-    P.cylz(mx, my, ht, ht + 0.12, 0.12, "Steel", seg=10)
-    P.cylz(mx, my, ht + 0.12, 1.0, 0.03, "Steel", seg=6)
-    P.cyl((mx - 0.04, my, 0.92), (mx + 0.07, my - 0.04, 1.0), 0.03, "Paint", r1=0.2, seg=12)
-    P.sphere(mx, my, 1.08, 0.035, "RedLamp", seg=6, rings=4)
-    P.cylz(mx, my, 1.0, 1.06, 0.015, "Steel", seg=6)
-    # Vehicle bay door on the east part of the south face.
-    P.box(B.X(0.85), sf - 0.005, 0.05, 0.4, 0.28, 0.02, "Dark", bevel=0.0)
-    for i in range(4):
-        P.box(B.X(0.85) - 0.24 + i * 0.16, sf - 0.03, 0.41, 0.45, 0.08, 0.015, "Hazard" if i % 2 == 0 else "Dark",
-              bevel=0.0)
+    for i in range(4):  # office windows
+        P.box(-1.08 + 0.375 * i, sf - 0.004, 0.2, 0.34, 0.14, 0.012, "Window", bevel=0.0)
+    for z in (0.18, 0.34):
+        P.box(-0.5175, sf - 0.006, z, z + 0.018, 0.74, 0.014, "Hull", bevel=0.0)
+    bay_door(P, 0.88, sf, 0.3, 0.36)
+    # Command tower: armoured base, flared glazed bridge, roof cap.
+    tx, ty = -0.42, 0.06
+    P.cbox(tx, ty, ht, ht + 0.24, 0.74, 0.78, 0.14, "Hull", top=(0.94, 0.94), bevel=0.006)
+    P.cbox(tx, ty, ht + 0.12, ht + 0.17, 0.725, 0.765, 0.14, "Team")
+    P.cbox(tx, ty, ht + 0.24, ht + 0.38, 0.62, 0.64, 0.12, "Glass", top=(1.08, 1.08))
+    P.cbox(tx, ty, ht + 0.38, ht + 0.42, 0.68, 0.7, 0.13, "Hull", top=(0.8, 0.8), bevel=0.006)
+    P.cbox(tx, ty, ht + 0.42, ht + 0.432, 0.5, 0.5, 0.1, "Deck")
+    P.ring(tx + 0.1, ty - 0.1, ht + 0.43, ht + 0.438, 0.24, 0.28, "Paint", seg=28)
+    P.cylz(tx + 0.1, ty - 0.1, ht + 0.43, ht + 0.445, 0.05, "RedLamp", seg=10)
+    mast(P, tx - 0.34, ty + 0.34, ht + 0.42, 1.14)
+    vent_box(P, tx - 0.3, ty - 0.32, ht + 0.42, 0.1, 0.08, h=0.05)
+    # Roof kit: radar dish, fan, vents.
+    dish(P, 0.99, 0.72, ht, 0.24, yaw=-0.7)
+    fan(P, 0.58, 1.05, ht, 0.14)
+    vent_box(P, 0.6, 0.3, ht, 0.14, 0.2)
+    # Construction crane over the vehicle bay.
+    cx, cy = 1.05, -0.2
+    P.cbox(cx, cy, ht, ht + 0.42, 0.055, 0.055, 0.015, "Steel")
+    P.cylz(cx, cy, ht + 0.42, ht + 0.45, 0.085, "Hull", seg=14)
+    P.box(cx, cy - 0.38, ht + 0.45, ht + 0.5, 0.035, 0.68, "Hazard")
+    P.box(cx, cy + 0.22, ht + 0.43, ht + 0.52, 0.07, 0.09, "Steel")  # counterweight
+    P.cylz(cx, cy - 0.98, ht + 0.22, ht + 0.45, 0.006, "Steel", seg=6)
+    P.box(cx, cy - 0.98, ht + 0.17, ht + 0.22, 0.03, 0.03, "Hazard")
     M.add("body", P)
     return M
 
@@ -587,16 +705,39 @@ def build_power():
     P = Part()
     ht = 0.28
     base_block(P, B, ht)
-    cy = -0.08
-    P.cyl((-0.46, cy, 0.42), (0.46, cy, 0.42), 0.07, "Steel", seg=8)  # connector pipe
-    for dx in (-0.46, 0.46):
-        P.cylz(dx, cy, ht, 0.72, 0.36, "Hull", r1=0.30, seg=20)  # cooling tower
-        P.cylz(dx, cy, 0.50, 0.57, 0.335, "Team", seg=20)
-        P.cylz(dx, cy, 0.72, 0.76, 0.31, "Steel", seg=20)  # rim
-        P.cylz(dx, cy, 0.735, 0.765, 0.25, "Reactor", seg=20)  # glowing core
-    P.box(0, B.Y(0.15), ht, ht + 0.08, 0.2, 0.12, "Steel")  # transformer
+    sf = south_face(B)
+    for a in (-1, 1):
+        P.box(0.45 * a, sf - 0.004, 0.115, 0.13, 0.22, 0.008, "Reactor", bevel=0.0)
+    cy = -0.02
+    for dx in (-0.45, 0.45):  # reactor towers
+        P.cylz(dx, cy, ht, ht + 0.06, 0.38, "Steel", seg=28)
+        P.cylz(dx, cy, ht + 0.06, ht + 0.3, 0.35, "Hull", r1=0.27, seg=28)
+        P.cylz(dx, cy, ht + 0.3, ht + 0.42, 0.27, "Hull", r1=0.31, seg=28)
+        P.cylz(dx, cy, ht + 0.27, ht + 0.32, 0.284, "Team", seg=28)
+        P.cylz(dx, cy, ht + 0.42, ht + 0.46, 0.325, "Steel", seg=28)
+        P.cylz(dx, cy, ht + 0.44, ht + 0.467, 0.27, "Reactor", seg=28)  # glowing core
+        P.ring(dx, cy, ht + 0.06, ht + 0.075, 0.35, 0.385, "Reactor", seg=28)
+        for i in range(6):  # coolant fins
+            a = i * math.pi / 3 + math.pi / 6
+            P.box(dx + 0.36 * math.cos(a), cy + 0.36 * math.sin(a), ht, ht + 0.27, 0.05, 0.014, "Steel",
+                  taper=(0.3, 1.0), shift=(-0.035, 0.0), rz=a, bevel=0.0)
+    P.cyl((-0.16, cy, ht + 0.15), (0.16, cy, ht + 0.15), 0.05, "Steel", seg=12)  # conduit
+    P.cyl((-0.06, cy, ht + 0.15), (0.06, cy, ht + 0.15), 0.06, "Reactor", seg=12)
+    # Transformer bank at the back.
+    P.box(0, 0.66, ht, ht + 0.1, 0.36, 0.12, "Steel")
     for i in range(3):
-        P.cylz(-0.12 + 0.12 * i, B.Y(0.15), ht + 0.08, ht + 0.16, 0.025, "Paint", seg=6)
+        ix = -0.24 + 0.24 * i
+        P.cylz(ix, 0.66, ht + 0.1, ht + 0.24, 0.022, "Paint", seg=8)
+        for k in range(3):
+            P.cylz(ix, 0.66, ht + 0.12 + 0.04 * k, ht + 0.135 + 0.04 * k, 0.045, "Paint", seg=10)
+        P.sphere(ix, 0.66, ht + 0.25, 0.025, "Reactor", seg=8, rings=4)
+    # Capacitor cells and a control console at the front.
+    for a in (-1, 1):
+        P.cylz(0.56 * a, -0.64, ht, ht + 0.12, 0.085, "Hull", seg=16)
+        P.cylz(0.56 * a, -0.64, ht + 0.05, ht + 0.07, 0.09, "Steel", seg=16)
+        P.cylz(0.56 * a, -0.64, ht + 0.12, ht + 0.13, 0.06, "Reactor", seg=16)
+    P.box(0, -0.66, ht, ht + 0.09, 0.2, 0.08, "Steel", taper=(1.0, 0.5), shift=(0.0, 0.04))
+    P.box(0, -0.705, ht + 0.03, ht + 0.07, 0.16, 0.01, "Glass", bevel=0.0)
     M.add("body", P)
     return M
 
@@ -607,32 +748,45 @@ def build_refinery():
     P = Part()
     ht = 0.35
     base_block(P, B, ht)
-    # Ore hopper on the roof.
-    hx0, hx1, hy0, hy1 = B.X(0.08), B.X(0.48), B.Y(0.88), B.Y(0.38)
-    hcx, hcy, hhx, hhy = (hx0 + hx1) / 2, (hy0 + hy1) / 2, (hx1 - hx0) / 2, (hy1 - hy0) / 2
-    P.box(hcx, hcy, ht + 0.02, ht + 0.06, hhx - 0.05, hhy - 0.05, "Ore", bevel=0.0)
-    P.box(hcx, hcy, ht + 0.06, ht + 0.11, hhx - 0.12, hhy - 0.12, "Ore", taper=(0.7, 0.6), bevel=0.0)
-    for s in (-1, 1):
-        P.box(hcx, hcy + s * (hhy - 0.025), ht, ht + 0.12, hhx, 0.025, "Steel", bevel=0.005)
-        P.box(hcx + s * (hhx - 0.025), hcy, ht, ht + 0.12, 0.025, hhy, "Steel", bevel=0.005)
-    # Chimney.
-    cx, cy = B.X(0.12), B.Y(0.2)
-    P.cylz(cx, cy, ht, 1.0, 0.11, "Pipe", r1=0.09, seg=12)
-    P.cylz(cx, cy, 0.86, 0.92, 0.1, "Team", seg=12)
-    P.cylz(cx, cy, 0.99, 1.01, 0.07, "Dark", seg=12)
-    # Silo with team band and lamp.
-    sx, sy = B.X(0.78), -0.08
-    P.cylz(sx, sy, ht, 0.85, 0.42, "Hull", seg=20)
-    P.sphere(sx, sy, 0.85, 0.42, "Hull", scale=(1, 1, 0.35), seg=20, rings=6, hemi=True)
-    P.cylz(sx, sy, 0.72, 0.8, 0.425, "Team", seg=20)
-    for k in range(3):
-        P.cylz(sx, sy, 0.45 + 0.08 * k, 0.47 + 0.08 * k, 0.425, "Steel", seg=20)
-    P.cylz(sx, sy, 0.98, 1.02, 0.04, "Lamp", seg=8)
-    # Pipe from hopper to silo.
-    P.cyl((hx1, 0.1, ht + 0.1), (sx - 0.4, 0.1, ht + 0.1), 0.05, "Pipe", seg=8)
-    # Unloading dock on the south face.
-    P.box(B.X(0.3), south_face(B) - 0.005, 0.05, 0.25, 0.35, 0.02, "Dark", bevel=0.0)
-    P.box(B.X(0.3), south_face(B) - 0.01, 0.26, 0.29, 0.38, 0.02, "Lamp", bevel=0.0)
+    sf = south_face(B)
+    # Ore hopper: flared funnel with a rim and a heap of ore.
+    hcx, hcy, hhx, hhy = -0.66, -0.26, 0.54, 0.44
+    P.cbox(hcx, hcy, ht, ht + 0.16, hhx - 0.1, hhy - 0.1, 0.06, "Steel", top=(hhx / (hhx - 0.1), hhy / (hhy - 0.1)))
+    P.cbox(hcx, hcy, ht + 0.16, ht + 0.2, hhx, hhy, 0.075, "Hull", bevel=0.005)
+    for a in (-1, 1):
+        P.box(hcx, hcy + a * (hhy - 0.03), ht + 0.2, ht + 0.25, hhx - 0.07, 0.02, "Hull", bevel=0.005)
+        P.box(hcx + a * (hhx - 0.03), hcy, ht + 0.2, ht + 0.25, 0.02, hhy - 0.07, "Hull", bevel=0.005)
+    P.box(hcx, hcy, ht + 0.2, ht + 0.225, hhx - 0.05, hhy - 0.05, "Ore", bevel=0.0)
+    P.box(hcx, hcy, ht + 0.225, ht + 0.29, hhx - 0.12, hhy - 0.12, "Ore", taper=(0.6, 0.55), bevel=0.0)
+    for (x, y, h, rz) in ((-0.3, 0.12, 0.07, 0.4), (0.25, -0.15, 0.08, 1.1), (-0.1, -0.2, 0.06, 0.8)):
+        P.box(hcx + x, hcy + y, ht + 0.22, ht + 0.22 + h, 0.07, 0.06, "Ore", taper=(0.3, 0.3), rz=rz, bevel=0.0)
+    # Furnace stacks.
+    for (cx, cy, r, top) in ((-1.08, 0.6, 0.12, 1.02), (-0.76, 0.66, 0.075, 0.84)):
+        P.cylz(cx, cy, ht, ht + 0.05, r * 1.3, "Steel", seg=16)
+        P.cylz(cx, cy, ht + 0.05, top, r, "Pipe", r1=r * 0.78, seg=16)
+        P.cylz(cx, cy, top - 0.17, top - 0.11, r * 0.86, "Team", seg=16)
+        P.cylz(cx, cy, top - 0.07, top - 0.05, r * 0.84, "Lamp", seg=16)
+        P.cylz(cx, cy, top - 0.01, top + 0.012, r * 0.82, "Steel", seg=16)
+        P.cylz(cx, cy, top + 0.012, top + 0.016, r * 0.62, "Dark", seg=16)
+    # Main silo with ladder, and a smaller buffer tank.
+    sx, sy = 0.84, -0.02
+    tank(P, sx, sy, ht, 0.82, 0.4, seg=28)
+    P.cylz(sx, sy, 0.7, 0.77, 0.408, "Team", seg=28)
+    P.cylz(sx, sy, 0.96, 1.0, 0.1, "Steel", seg=12)
+    P.cylz(sx, sy, 1.0, 1.03, 0.04, "Lamp", seg=8)
+    for a in (-1, 1):
+        P.box(sx + 0.04 * a, sy - 0.412, ht, 0.84, 0.006, 0.006, "Steel", bevel=0.0)
+    for k in range(8):
+        P.box(sx, sy - 0.412, ht + 0.04 + 0.06 * k, ht + 0.05 + 0.06 * k, 0.04, 0.005, "Steel", bevel=0.0)
+    tank(P, 0.2, 0.55, ht, 0.58, 0.2, bands=2, seg=20)
+    P.cylz(0.2, 0.55, 0.5, 0.54, 0.206, "Team", seg=20)
+    pipe(P, [(-0.14, -0.3, ht + 0.1), (0.3, -0.3, ht + 0.1), (0.3, -0.12, ht + 0.1), (0.46, -0.12, ht + 0.1)], 0.045)
+    pipe(P, [(0.2, 0.36, ht + 0.14), (0.2, 0.18, ht + 0.14), (0.48, 0.18, ht + 0.14)], 0.035)
+    pipe(P, [(-0.64, 0.66, ht + 0.07), (0.0, 0.66, ht + 0.07)], 0.035)
+    # Unloading dock and furnace glow slits on the south face.
+    bay_door(P, -0.66, sf, 0.4, 0.2, slats=3)
+    for i in range(3):
+        P.box(0.5 + 0.3 * i, sf - 0.004, 0.16, 0.22, 0.1, 0.012, "Ore", bevel=0.0)
     M.add("body", P)
     return M
 
@@ -643,21 +797,31 @@ def build_barracks():
     P = Part()
     ht = 0.42
     base_block(P, B, ht)
-    # Corrugated roof ribs (half cylinders running north-south).
-    for i in range(6):
-        rx = B.X(0.13 + 0.15 * i)
-        P.cyl((rx, B.Y(0.15), ht + 0.02), (rx, B.Y(0.85), ht + 0.02), 0.075, "Hull", seg=10)
-    # Door.
     sf = south_face(B)
-    P.box(0, sf - 0.005, 0.05, 0.33, 0.18, 0.02, "Dark", bevel=0.0)
-    P.box(0, sf - 0.01, 0.33, 0.36, 0.2, 0.02, "Window", bevel=0.0)
-    P.box(0, sf - 0.09, 0.0, 0.04, 0.24, 0.08, "Concrete")  # step
-    for s in (-1, 1):  # sandbags
-        P.box(0.55 * s, sf - 0.1, 0.0, 0.1, 0.18, 0.06, "Crate", taper=(0.9, 0.7))
-    # Flag.
-    fx, fy = B.X(0.88), B.Y(0.3)
-    P.cylz(fx, fy, ht, 1.05, 0.015, "Paint", seg=6)
-    P.box(fx - 0.17, fy, 0.86, 1.02, 0.16, 0.008, "Team", bevel=0.0, rz=0.12)
+    n = B.hy - 0.04
+    # Vaulted roof: three low arches with ridge beams and hoops.
+    for x in (-0.56, 0.0, 0.56):
+        P.cyl((x, sf + 0.06, ht - 0.14), (x, n - 0.06, ht - 0.14), 0.3, "Hull", seg=24)
+        for y in (sf + 0.1, (sf + n) / 2, n - 0.1):
+            P.cyl((x, y - 0.025, ht - 0.14), (x, y + 0.025, ht - 0.14), 0.308, "Steel", seg=24)
+    for x in (-0.28, 0.28):
+        P.box(x, (sf + n) / 2, ht, ht + 0.06, 0.022, (n - sf) / 2 - 0.05, "Steel")
+    # Door, slit windows, step.
+    bay_door(P, 0, sf, 0.16, 0.3, slats=0, light="Window")
+    for a in (-1, 1):
+        P.box(0.52 * a, sf - 0.004, 0.2, 0.26, 0.16, 0.012, "Window", bevel=0.0)
+    P.box(0, sf - 0.1, 0.05, 0.075, 0.26, 0.08, "Concrete")
+    # Forecourt barriers and floodlights.
+    for a in (-1, 1):
+        P.cbox(0.56 * a, sf - 0.13, 0.05, 0.14, 0.2, 0.035, 0.01, "Concrete", top=(0.95, 0.45))
+        P.box(0.56 * a, sf - 0.13, 0.14, 0.148, 0.18, 0.012, "Hazard", bevel=0.0)
+        P.cylz(0.84 * a, sf - 0.14, 0.05, 0.3, 0.012, "Steel", seg=6)
+        P.box(0.84 * a, sf - 0.14, 0.3, 0.33, 0.03, 0.025, "Lamp", bevel=0.0)
+    # Pennant on the south-east pylon, comms mast on the north-west one.
+    fx, fy = B.hx - 0.075, sf + 0.035
+    P.cylz(fx, fy, ht + 0.08, 1.05, 0.012, "Paint", seg=6)
+    P.box(fx - 0.15, fy, 0.88, 1.02, 0.14, 0.006, "Team", bevel=0.0, rz=0.12)
+    mast(P, -fx, n - 0.035, ht + 0.08, 0.95, lamp="GreenLamp", bars=2)
     M.add("body", P)
     return M
 
@@ -666,38 +830,30 @@ def build_factory():
     B = Bldg("factory")
     M = Model("factory")
     P = Part()
-    ht = 0.7
+    ht = 0.62
     base_block(P, B, ht)
     sf = south_face(B)
-    # Main vehicle door with hazard header.
-    dw, dh = B.W * 0.64 / 2, ht * 0.75
-    P.box(0, sf - 0.005, 0.05, dh, dw, 0.02, "Dark", bevel=0.0)
-    n = 12
-    for i in range(n):
-        x = -dw + (i + 0.5) * 2 * dw / n
-        P.box(x, sf - 0.03, dh, dh + 0.05, dw / n, 0.02, "Hazard" if i % 2 == 0 else "Dark", bevel=0.0)
-    for k in range(4):
-        P.box(0, sf - 0.03, 0.12 + 0.11 * k, 0.13 + 0.11 * k, dw - 0.03, 0.006, "Steel", bevel=0.0)
-    for s in (-1, 1):
-        P.cylz(s * (dw + 0.1), sf - 0.03, dh + 0.04, dh + 0.1, 0.035, "Lamp", seg=8)
-    # Upper workshop block.
-    px0, px1, py0, py1 = B.X(0.1), B.X(0.65), B.Y(0.72), B.Y(0.22)
-    P.box((px0 + px1) / 2, (py0 + py1) / 2, ht, ht + 0.16, (px1 - px0) / 2, (py1 - py0) / 2, "Hull")
-    P.box((px0 + px1) / 2, (py0 + py1) / 2, ht + 0.08, ht + 0.13, (px1 - px0) / 2 + 0.005,
-          (py1 - py0) / 2 + 0.005, "Team", bevel=0.0)
-    for i in range(5):  # skylights
-        P.box(px0 + 0.15 + i * 0.29, (py0 + py1) / 2, ht + 0.16, ht + 0.18, 0.08, 0.3, "Glass", bevel=0.0)
-    # Vent fans.
-    for fx in (0.77, 0.9):
-        vx, vy = B.X(fx), B.Y(0.45)
-        P.cylz(vx, vy, ht, ht + 0.07, 0.17, "Steel", seg=16)
-        P.cylz(vx, vy, ht + 0.07, ht + 0.075, 0.14, "Dark", seg=16)
-        for a in (0.3, 0.3 + math.pi / 2):
-            P.box(vx, vy, ht + 0.07, ht + 0.09, 0.14, 0.02, "Hull", bevel=0.0, rz=a)
-    # Smoke stacks at the back.
-    for x in (B.X(0.75), B.X(0.88)):
-        P.cylz(x, B.Y(0.15), ht, 1.05, 0.06, "Pipe", seg=10)
-        P.cylz(x, B.Y(0.15), 0.95, 1.0, 0.065, "Team", seg=10)
+    # Main vehicle door, side windows, warning lamps.
+    dx, dw, dh = -0.25, 0.9, 0.44
+    bay_door(P, dx, sf, dw, dh, slats=5)
+    for a in (-1, 1):
+        P.cylz(dx + a * (dw + 0.03), sf - 0.03, dh + 0.07, dh + 0.11, 0.03, "RedLamp", seg=10)
+    P.box(1.02, sf - 0.004, 0.28, 0.38, 0.2, 0.012, "Window", bevel=0.0)
+    # Sawtooth skylight roof over the assembly hall.
+    for i in range(4):
+        cx = -1.1 + i * 0.42
+        P.box(cx, 0.02, ht, ht + 0.17, 0.2, 0.7, "Hull", taper=(0.08, 1.0), shift=(0.18, 0.0), bevel=0.006)
+        P.box(cx + 0.2, 0.02, ht + 0.025, ht + 0.15, 0.004, 0.64, "Glass", bevel=0.0)
+    # Service roof: fans, vents, exhaust stacks.
+    for vx in (0.82, 1.14):
+        fan(P, vx, -0.5, ht, 0.14)
+        P.cylz(vx, 0.62, ht, ht + 0.05, 0.1, "Steel", seg=14)
+        P.cylz(vx, 0.62, ht + 0.05, 1.06, 0.07, "Pipe", r1=0.058, seg=14)
+        P.cylz(vx, 0.62, 0.92, 0.97, 0.066, "Team", seg=14)
+        P.cylz(vx, 0.62, 1.0, 1.02, 0.064, "Lamp", seg=14)
+        P.cylz(vx, 0.62, 1.06, 1.065, 0.045, "Dark", seg=14)
+    vent_box(P, 0.98, 0.08, ht, 0.24, 0.16)
+    pipe(P, [(0.82, 0.52, ht + 0.05), (0.82, 0.28, ht + 0.05)], 0.03)
     M.add("body", P)
     return M
 
@@ -707,22 +863,29 @@ def build_airpad():
     M = Model("airpad")
     P = Part()
     ht = 0.1
-    P.box(0, 0, 0, ht, B.hx, B.hy, "Asphalt", bevel=0.02)
-    t, inset = 0.03, 0.09
-    ex, ey = B.hx - inset, B.hy - inset
+    P.cbox(0, 0, 0, 0.045, B.hx, B.hy, 0.2, "Steel", bevel=0.008)
+    P.cbox(0, 0, 0.045, ht, B.hx - 0.01, B.hy - 0.01, 0.2, "Asphalt", top=(0.97, 0.97))
     z0, z1 = ht - 0.002, ht + 0.006
-    for s in (-1, 1):  # team border
-        P.box(0, s * ey, z0, z1, ex + t, t, "Team", bevel=0.0)
-        P.box(s * ex, 0, z0, z1, t, ey - t, "Team", bevel=0.0)
-    P.ring(0, 0, z0, z1, 0.56, 0.62, "Paint", seg=32)
+    # Team border following the clipped corners.
+    E, c, d, t = (B.hx - 0.01) * 0.97, 0.2 * 0.97, 0.08, 0.015
+    e, ci = E - d, c - d * (2 - math.sqrt(2))
+    for s in (-1, 1):
+        P.box(0, s * e, z0, z1, e - ci, t, "Team", bevel=0.0)
+        P.box(s * e, 0, z0, z1, t, e - ci, "Team", bevel=0.0)
+        for b in (-1, 1):
+            P.box(s * (e - ci / 2), b * (e - ci / 2), z0, z1, ci * math.sqrt(0.5) + t * 0.4, t, "Team", bevel=0.0,
+                  rz=-s * b * math.pi / 4)
+            P.cylz(s * (e - ci / 2 + 0.03), b * (e - ci / 2 + 0.03), ht - 0.01, ht + 0.05, 0.024, "Steel", seg=10)
+            P.cylz(s * (e - ci / 2 + 0.03), b * (e - ci / 2 + 0.03), ht + 0.05, ht + 0.075, 0.02, "RedLamp", seg=10)
+    P.ring(0, 0, z0, z1, 0.54, 0.6, "Paint", seg=40)
     for s in (-1, 1):  # "H"
         P.box(0.17 * s, 0, z0, z1, 0.035, 0.24, "Paint", bevel=0.0)
     P.box(0, 0, z0, z1, 0.14, 0.035, "Paint", bevel=0.0)
-    for a in (-1, 1):  # corner beacons
-        for b in (-1, 1):
-            x, y = a * (B.hx - 0.05), b * (B.hy - 0.05)
-            P.cylz(x, y, ht, ht + 0.05, 0.03, "Steel", seg=8)
-            P.cylz(x, y, ht + 0.05, ht + 0.08, 0.025, "GreenLamp", seg=8)
+    for i in range(12):  # flush landing lights
+        a = i * math.pi / 6
+        P.cylz(0.69 * math.cos(a), 0.69 * math.sin(a), z0, ht + 0.01, 0.022, "GreenLamp", seg=8)
+    for i in range(3):  # approach chevron on the south edge
+        P.box(-0.1 + 0.1 * i, -0.755, z0, z1, 0.03, 0.012, "Hazard", bevel=0.0, rz=0.0)
     M.add("body", P)
     return M
 
@@ -730,22 +893,31 @@ def build_airpad():
 def build_wall():
     M = Model("wall")
     P = Part()
-    h = 0.5
-    P.box(0, 0, 0, 0.3, 0.5, 0.5, "Concrete", bevel=0.015)
+    P.box(0, 0, 0, 0.1, 0.5, 0.5, "Wall", bevel=0.01)  # footing (full tile, so runs join up)
+    P.box(0, 0, 0.1, 0.3, 0.47, 0.47, "Concrete", bevel=0.01)
+    for a in (-1, 1):  # armour plates
+        P.box(0, a * 0.475, 0.12, 0.28, 0.34, 0.02, "Hull", taper=(0.94, 1.0), bevel=0.006)
+        P.box(a * 0.475, 0, 0.12, 0.28, 0.02, 0.34, "Hull", taper=(1.0, 0.94), bevel=0.006)
     P.box(0, 0, 0.3, 0.36, 0.495, 0.495, "Team", bevel=0.0)
-    P.box(0, 0, 0.36, h, 0.5, 0.5, "Concrete", bevel=0.015)
-    P.box(0, 0, h, h + 0.015, 0.3, 0.25, "Wall", bevel=0.005)
+    P.box(0, 0, 0.36, 0.46, 0.5, 0.5, "Concrete", taper=(0.92, 0.92), bevel=0.01)
+    P.box(0, 0, 0.46, 0.5, 0.4, 0.4, "Wall", bevel=0.008)
+    P.cbox(0, 0, 0.5, 0.52, 0.2, 0.2, 0.06, "Steel")
+    for a in (-1, 1):
+        for b in (-1, 1):
+            P.cbox(a * 0.32, b * 0.32, 0.5, 0.53, 0.05, 0.05, 0.015, "Hull")
     M.add("body", P)
     return M
 
 
 def turret_base(P, B, ht=0.18):
-    P.box(0, 0, 0, 0.04, B.hx, B.hy, "Steel", bevel=0.01)
-    P.box(0, 0, 0.04, ht, B.hx - 0.02, B.hy - 0.02, "Wall", taper=(0.9, 0.9))
+    P.cbox(0, 0, 0, 0.04, B.hx, B.hy, 0.12, "Steel", bevel=0.008)
+    P.cbox(0, 0, 0.04, ht, B.hx - 0.02, B.hy - 0.02, 0.12, "Wall", top=(0.86, 0.86))
     for a in (-1, 1):
         for b in (-1, 1):
-            P.box(a * (B.hx - 0.1), b * (B.hy - 0.1), ht - 0.06, ht - 0.03, 0.05, 0.05, "Team", bevel=0.0)
-    P.cylz(0, 0, ht, ht + 0.025, 0.3, "Steel", seg=20)
+            P.box(a * 0.347, b * 0.347, 0.06, 0.11, 0.07, 0.012, "Team", bevel=0.0, rz=-a * b * math.pi / 4)
+            P.cylz(a * 0.29, b * 0.29, ht, ht + 0.012, 0.02, "Hull", seg=8)
+    P.ring(0, 0, ht - 0.002, ht + 0.008, 0.3, 0.314, "Reactor", seg=28)
+    P.cylz(0, 0, ht, ht + 0.025, 0.3, "Steel", seg=28)
 
 
 def build_turret():
@@ -756,13 +928,18 @@ def build_turret():
     M.add("body", P)
     T = Part()
     z = 0.205
-    T.cylz(0, 0, z, z + 0.04, 0.24, "Hull", seg=16)
-    T.box(-0.025, 0, z + 0.03, z + 0.18, 0.2, 0.16, "Team", taper=(0.85, 0.85))
-    T.box(0.16, 0, z + 0.05, z + 0.15, 0.04, 0.12, "Hull")
+    T.cylz(0, 0, z, z + 0.04, 0.25, "Hull", seg=24)
+    T.cbox(-0.03, 0, z + 0.03, z + 0.19, 0.2, 0.17, 0.05, "Team", top=(0.82, 0.8), bevel=0.006)
+    T.box(0.17, 0, z + 0.05, z + 0.15, 0.045, 0.12, "Hull", taper=(0.8, 0.85))  # mantlet
+    T.box(-0.22, 0, z + 0.05, z + 0.14, 0.04, 0.12, "Steel")  # ammo box
     for s in (-1, 1):
-        T.cyl((0.18, 0.065 * s, z + 0.1), (0.44, 0.065 * s, z + 0.1), 0.025, "Steel", seg=8)
-        T.cyl((0.40, 0.065 * s, z + 0.1), (0.44, 0.065 * s, z + 0.1), 0.035, "Steel", seg=8)
-    T.box(-0.08, 0.08, z + 0.18, z + 0.21, 0.04, 0.03, "Glass", bevel=0.0)
+        T.box(-0.03, 0.172 * s, z + 0.05, z + 0.15, 0.14, 0.018, "Hull", taper=(0.85, 1.0))  # cheek armour
+        T.cyl((0.2, 0.065 * s, z + 0.1), (0.46, 0.065 * s, z + 0.1), 0.022, "Steel", seg=10)
+        T.cyl((0.2, 0.065 * s, z + 0.1), (0.31, 0.065 * s, z + 0.1), 0.036, "Steel", seg=10)  # barrel jacket
+        T.cyl((0.42, 0.065 * s, z + 0.1), (0.47, 0.065 * s, z + 0.1), 0.032, "Steel", seg=10)
+        T.cyl((0.47, 0.065 * s, z + 0.1), (0.472, 0.065 * s, z + 0.1), 0.018, "Dark", seg=10)
+    T.box(-0.06, 0.07, z + 0.19, z + 0.215, 0.045, 0.035, "Glass", bevel=0.0)  # sensor
+    T.cylz(-0.13, -0.08, z + 0.18, z + 0.36, 0.006, "Steel", seg=6)
     M.add("turret", T, pivot=(0.0, 0.0, z))
     return M
 
@@ -775,17 +952,20 @@ def build_rocket_turret():
     M.add("body", P)
     T = Part()
     z = 0.205
-    T.cylz(0, 0, z, z + 0.03, 0.2, "Hull", seg=16)
-    T.box(0, 0, z + 0.03, z + 0.13, 0.11, 0.11, "Steel")
-    T.cyl((0, -0.21, z + 0.17), (0, 0.21, z + 0.17), 0.03, "Steel", seg=8)  # pod axle
+    T.cylz(0, 0, z, z + 0.03, 0.22, "Hull", seg=24)
+    T.cbox(0, 0, z + 0.03, z + 0.14, 0.11, 0.1, 0.03, "Steel", top=(0.85, 0.85))
+    T.box(0.1, 0, z + 0.06, z + 0.11, 0.02, 0.045, "Glass", bevel=0.0)  # sensor
+    T.cyl((0, -0.21, z + 0.17), (0, 0.21, z + 0.17), 0.03, "Steel", seg=10)  # pod axle
     for s in (-1, 1):
-        cy = 0.14 * s
-        T.box(-0.025, cy, z + 0.1, z + 0.27, 0.25, 0.085, "Team")
+        cy = 0.145 * s
+        T.box(-0.025, cy, z + 0.09, z + 0.27, 0.25, 0.09, "Team", bevel=0.02)
         T.box(-0.025, cy, z + 0.27, z + 0.285, 0.2, 0.06, "Hull", bevel=0.0)
+        T.box(0.222, cy, z + 0.108, z + 0.252, 0.006, 0.074, "Steel", bevel=0.0)
+        T.box(-0.278, cy, z + 0.12, z + 0.24, 0.006, 0.07, "Dark", bevel=0.0)
         for k in (-1, 1):
-            for zz in (z + 0.145, z + 0.225):
-                T.cyl((0.2, cy + 0.04 * k, zz), (0.235, cy + 0.04 * k, zz), 0.03, "Dark", seg=8)
-                T.cyl((0.205, cy + 0.04 * k, zz), (0.245, cy + 0.04 * k, zz), 0.018, "Red", r1=0.0, seg=8)
+            for zz in (z + 0.145, z + 0.215):
+                T.cyl((0.2, cy + 0.037 * k, zz), (0.238, cy + 0.037 * k, zz), 0.029, "Dark", seg=10)
+                T.cyl((0.21, cy + 0.037 * k, zz), (0.25, cy + 0.037 * k, zz), 0.018, "Red", r1=0.0, seg=10)
     M.add("turret", T, pivot=(0.0, 0.0, z))
     return M
 
@@ -796,25 +976,31 @@ def build_armory():
     P = Part()
     ht = 0.4
     base_block(P, B, ht)
-    for i, (fx, fy) in enumerate(((0.12, 0.3), (0.42, 0.3), (0.12, 0.62), (0.42, 0.62))):
-        cx, cy = B.X(fx + 0.12), B.Y(fy + 0.11)
-        m = "Olive" if i % 2 == 0 else "Crate"
-        P.box(cx, cy, ht + 0.03, ht + 0.15, 0.22, 0.2, m)
-        P.box(cx, cy, ht + 0.08, ht + 0.1, 0.225, 0.205, "Steel", bevel=0.0)
-    # Missile rack.
-    mx = B.X(0.82)
-    for k, my in enumerate((0.25, -0.05, -0.35)):
-        P.cylz(mx, my, ht + 0.03, ht + 0.4, 0.07, "Red", seg=10)
-        P.cylz(mx, my, ht + 0.4, ht + 0.5, 0.07, "Paint", r1=0.0, seg=10)
-        P.cylz(mx, my, ht + 0.12, ht + 0.16, 0.072, "Team", seg=10)
-    P.box(mx, -0.05, ht + 0.03, ht + 0.08, 0.12, 0.45, "Steel")
-    # Blast door.
     sf = south_face(B)
-    P.box(0, sf - 0.005, 0.05, 0.3, 0.38, 0.02, "Steel", bevel=0.0)
-    P.box(0, sf - 0.03, 0.05, 0.3, 0.008, 0.008, "Hull", bevel=0.0)
-    for k in range(3):
-        P.box(0, sf - 0.03, 0.09 + 0.07 * k, 0.11 + 0.07 * k, 0.36, 0.006, "Hazard", bevel=0.0)
-    P.cylz(0, sf - 0.03, 0.33, 0.37, 0.03, "Lamp", seg=8)
+    # Blast door with warning beacons.
+    bay_door(P, 0, sf, 0.36, 0.26, slats=3, light="RedLamp")
+    for a in (-1, 1):
+        P.cylz(0.39 * a, sf - 0.03, 0.33, 0.37, 0.028, "RedLamp", seg=10)
+    # Ammunition crates and an armoured roof hatch.
+    for (cx, cy, hx, hy, h, m) in ((-0.5, 0.48, 0.22, 0.2, 0.14, "Olive"), (-0.5, 0.02, 0.2, 0.18, 0.12, "Crate"),
+                                   (-0.46, 0.46, 0.13, 0.12, 0.24, "Crate")):
+        P.box(cx, cy, ht + 0.01, ht + h, hx, hy, m)
+        P.box(cx, cy, ht + h * 0.55, ht + h * 0.55 + 0.02, hx + 0.004, hy + 0.004, "Steel", bevel=0.0)
+    P.cbox(-0.48, -0.48, ht, ht + 0.03, 0.2, 0.18, 0.04, "Steel", bevel=0.005)
+    P.box(-0.48, -0.48, ht + 0.03, ht + 0.036, 0.15, 0.02, "Hazard", bevel=0.0)
+    # Vertical missile cells under a loading gantry.
+    mx = 0.42
+    P.box(mx, 0.03, ht, ht + 0.06, 0.16, 0.56, "Steel")
+    for my in (0.4, 0.03, -0.34):
+        P.cylz(mx, my, ht + 0.06, ht + 0.3, 0.095, "Hull", seg=16)
+        P.cylz(mx, my, ht + 0.2, ht + 0.25, 0.1, "Team", seg=16)
+        P.cylz(mx, my, ht + 0.3, ht + 0.305, 0.08, "Dark", seg=16)
+        P.cylz(mx, my, ht + 0.3, ht + 0.37, 0.06, "Red", seg=12)
+        P.cylz(mx, my, ht + 0.37, ht + 0.47, 0.06, "Paint", r1=0.0, seg=12)
+    for gy in (0.62, -0.56):
+        P.box(0.7, gy, ht, ht + 0.56, 0.025, 0.025, "Steel")
+    P.box(0.7, 0.03, ht + 0.56, ht + 0.6, 0.03, 0.64, "Hazard")
+    P.box(0.56, 0.03, ht + 0.565, ht + 0.595, 0.14, 0.03, "Steel")  # trolley arm
     M.add("body", P)
     return M
 
@@ -826,21 +1012,34 @@ def build_tech_lab():
     ht = 0.45
     base_block(P, B, ht)
     sf = south_face(B)
-    for i in range(5):
-        P.box(B.X(0.13 + 0.185 * i), sf - 0.005, 0.15, 0.32, 0.09, 0.015, "Glass", bevel=0.0)
-    dx, dy = B.X(0.4), -0.08
-    P.cylz(dx, dy, ht, ht + 0.1, 0.42, "Hull", seg=24)
-    P.cylz(dx, dy, ht + 0.06, ht + 0.1, 0.425, "Team", seg=24)
-    P.sphere(dx, dy, ht + 0.1, 0.36, "Research", scale=(1, 1, 0.8), seg=20, rings=8, hemi=True)
-    for a in range(4):  # dome ribs
-        ang = a * math.pi / 4
-        P.box(dx, dy, ht + 0.1, ht + 0.115, 0.37, 0.012, "Steel", bevel=0.0, rz=ang)
-    mx, my = B.X(0.84), 0.0
-    P.box(mx, my, ht, ht + 0.06, 0.1, 0.1, "Steel")
-    P.cylz(mx, my, ht + 0.06, 1.08, 0.022, "Steel", seg=6)
-    for k in range(3):
-        P.box(mx, my, ht + 0.22 + 0.15 * k, ht + 0.24 + 0.15 * k, 0.1 - 0.02 * k, 0.012, "Hull", bevel=0.0)
-    P.sphere(mx, my, 1.1, 0.035, "GreenLamp", seg=8, rings=4)
+    for i in range(4):  # glazed front
+        P.box(-0.6 + 0.4 * i, sf - 0.004, 0.17, 0.33, 0.15, 0.012, "Glass", bevel=0.0)
+    for z in (0.155, 0.33):
+        P.box(0, sf - 0.006, z, z + 0.016, 0.78, 0.014, "Hull", bevel=0.0)
+    # Research dome with frame hoops and an emitter spike.
+    dx, dy, R = -0.2, -0.05, 0.4
+    P.cylz(dx, dy, ht, ht + 0.08, 0.46, "Hull", seg=32)
+    P.cylz(dx, dy, ht + 0.045, ht + 0.075, 0.465, "Team", seg=32)
+    P.cylz(dx, dy, ht + 0.08, ht + 0.1, 0.43, "Steel", seg=32)
+    P.sphere(dx, dy, ht + 0.1, R, "Research", scale=(1, 1, 0.85), seg=32, rings=12, hemi=True)
+    for deg in (28, 55):
+        a = math.radians(deg)
+        r, zc = R * math.cos(a), ht + 0.1 + R * 0.85 * math.sin(a)
+        P.ring(dx, dy, zc - 0.008, zc + 0.008, r - 0.01, r + 0.012, "Steel", seg=32)
+    top = ht + 0.1 + R * 0.85
+    P.cylz(dx, dy, top - 0.015, top + 0.03, 0.07, "Steel", seg=12)
+    P.cylz(dx, dy, top + 0.03, top + 0.17, 0.02, "Steel", r1=0.006, seg=8)
+    P.sphere(dx, dy, top + 0.18, 0.025, "Reactor", seg=8, rings=4)
+    for deg in (60, 180, 300):  # field projectors
+        a = math.radians(deg)
+        px, py = dx + 0.57 * math.cos(a), dy + 0.57 * math.sin(a)
+        P.cbox(px, py, ht, ht + 0.2, 0.045, 0.045, 0.012, "Hull", top=(0.55, 0.55))
+        P.sphere(px, py, ht + 0.22, 0.03, "Reactor", seg=8, rings=4)
+    # Comms mast, uplink dish, coolant tank.
+    mast(P, 0.64, 0.5, ht, 1.08, lamp="GreenLamp")
+    dish(P, 0.62, -0.5, ht, 0.17, yaw=-0.9)
+    tank(P, 0.62, 0.02, ht, ht + 0.16, 0.12, bands=1, seg=16)
+    pipe(P, [(0.5, 0.02, ht + 0.06), (0.24, 0.02, ht + 0.06)], 0.03)
     M.add("body", P)
     return M
 

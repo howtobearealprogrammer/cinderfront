@@ -33,6 +33,8 @@ and material names for each model.
   - `turret`: yaw around local Z, barrel along +X (tank, turret, rocket_turret)
   - `rotor`: spins around local Z (gunship, carrier); `rotor2` is the carrier's rear rotor
   - `load`: harvester ore pile, origin at its base; scale it on Z by the fill level
+  `Model.add` takes parts built in model coordinates and moves them to the pivot. A part
+  built around its own origin (the rotors) is added with `local=True`.
 - Materials are solid-colour Principled BSDF. Any part in `Team` takes the player's
   colour; it is blue (0.22, 0.52, 0.98) in the file. Other shared names: `Steel`, `Hull`,
   `Glass`, `Lamp`, `Tread`, `Ore`, plus a few extras (`Wall`, `Concrete`, `Hazard`,
@@ -48,5 +50,6 @@ and material names for each model.
 
 Write a `build_<name>()` function that returns a `Model`, register it in `BUILDERS`
 (and in `REQUIRED_PARTS` if it has moving parts), and add the name to `UNITS` or
-`STRUCTS`. Unit builders are written in pixels of the old 2D renderer (`PX` = 1/40 tile)
+`STRUCTS`. Structures share `base_block` (plinth, walls, pylons, parapet) and a small kit of
+details (`bay_door`, `fan`, `vent_box`, `mast`, `dish`, `tank`, `pipe`). Unit builders are written in pixels of the old 2D renderer (`PX` = 1/40 tile)
 so they match the old `draw_unit` shapes. Structure builders use tile units.
