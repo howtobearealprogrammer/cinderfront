@@ -452,3 +452,25 @@ fn supply_caps_limit_training() {
     build(&mut w, 0, StructKind::Airpad);
     assert_eq!(w.supply(0, Pool::Air).1, 40);
 }
+
+#[test]
+fn extra_production_buildings_train_faster() {
+    use cinderfront::sim::train_rate;
+    assert_eq!(train_rate(8, 1), 8);
+    assert_eq!(train_rate(8, 2), 12);
+    assert_eq!(train_rate(8, 3), 18);
+
+    let time = |barracks: usize| {
+        let mut w = World::new(7, 2);
+        w.players[0].credits += 50_000;
+        build(&mut w, 0, StructKind::Power);
+        for _ in 0..barracks {
+            build(&mut w, 0, StructKind::Barracks);
+        }
+        let t0 = w.tick;
+        train(&mut w, 0, UnitKind::Trooper);
+        w.tick - t0
+    };
+    let (one, two) = (time(1), time(2));
+    assert!(two < one && two * 10 >= one * 6, "one barracks {one} ticks, two {two}");
+}

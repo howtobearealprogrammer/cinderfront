@@ -176,6 +176,14 @@ impl Pool {
     }
 }
 
+/// Credits a train queue spends per tick with `n` production buildings of its kind:
+/// each building after the first cuts the time by a third (rate x 3/2).
+pub fn train_rate(base: i32, n: usize) -> i32 {
+    // Past ten buildings the bonus stops growing, which also keeps the maths in range.
+    let k = n.clamp(1, 10) as u32 - 1;
+    base * 3i32.pow(k) / 2i32.pow(k)
+}
+
 pub const TRAIN_AT: [StructKind; 3] = [StructKind::Barracks, StructKind::Factory, StructKind::Airpad];
 
 impl StructKind {
@@ -1448,6 +1456,7 @@ impl World {
                     continue;
                 }
                 let cost = kind.def().cost;
+                let rate = train_rate(rate, self.structs.values().filter(|s| s.owner as usize == p && s.kind == TRAIN_AT[q]).count());
                 let pl = &mut self.players[p];
                 let pay = rate.min(cost - pl.queues[q].spent).min(pl.credits);
                 pl.queues[q].spent += pay;
